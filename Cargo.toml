@@ -9,6 +9,7 @@ exclude = [".github/"]
 
 [workspace]
 members = [
+    "bin/pulse-reth/",
     "bin/reth-bench/",
     "bin/reth-bench-compare/",
     "bin/reth/",
@@ -86,6 +87,11 @@ members = [
     "crates/optimism/rpc/",
     "crates/optimism/storage",
     "crates/optimism/txpool/",
+    "crates/pulsechain/hardforks/",
+    "crates/pulsechain/chainspec/",
+    "crates/pulsechain/pulse/",
+    "crates/pulsechain/evm/",
+    "crates/pulsechain/node/",
     "crates/payload/basic/",
     "crates/payload/builder/",
     "crates/payload/builder-primitives/",
@@ -338,6 +344,7 @@ incremental = false
 [workspace.dependencies]
 # reth
 op-reth = { path = "crates/optimism/bin" }
+pulse-reth = { path = "bin/pulse-reth" }
 reth = { path = "bin/reth" }
 reth-storage-rpc-provider = { path = "crates/storage/rpc-provider" }
 reth-basic-payload-builder = { path = "crates/payload/basic" }
@@ -421,6 +428,11 @@ reth-optimism-cli = { path = "crates/optimism/cli", default-features = false }
 reth-optimism-consensus = { path = "crates/optimism/consensus", default-features = false }
 reth-optimism-forks = { path = "crates/optimism/hardforks", default-features = false }
 reth-optimism-payload-builder = { path = "crates/optimism/payload" }
+reth-pulsechain-forks = { path = "crates/pulsechain/hardforks", default-features = false }
+reth-pulsechain-chainspec = { path = "crates/pulsechain/chainspec", default-features = false }
+reth-pulsechain = { path = "crates/pulsechain/pulse", default-features = false }
+reth-pulsechain-evm = { path = "crates/pulsechain/evm", default-features = false }
+reth-pulsechain-node = { path = "crates/pulsechain/node", default-features = false }
 reth-optimism-primitives = { path = "crates/optimism/primitives", default-features = false }
 reth-optimism-rpc = { path = "crates/optimism/rpc" }
 reth-optimism-storage = { path = "crates/optimism/storage" }
