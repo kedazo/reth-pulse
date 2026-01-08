@@ -153,4 +153,75 @@ mod tests {
         assert_eq!(block, PULSECHAIN_PRIMORDIAL_BLOCK);
         assert_eq!(ttd, PULSECHAIN_TTD);
     }
+
+    #[test]
+    fn test_pulsechain_fork_id_at_genesis() {
+        use reth_ethereum_forks::Head;
+        use reth_ethereum_forks::ForkCondition;
+        use reth_ethereum_forks::ForkHash;
+
+        // Print all forks for debugging
+        println!("\nPulseChain hardforks list:");
+        for (fork, condition) in PULSECHAIN_MAINNET.hardforks.forks_iter() {
+            match condition {
+                ForkCondition::Block(b) => println!("  {:?} -> Block({})", fork, b),
+                ForkCondition::Timestamp(t) => println!("  {:?} -> Timestamp({})", fork, t),
+                ForkCondition::TTD { activation_block_number, fork_block, total_difficulty } => {
+                    println!("  {:?} -> TTD {{ activation: {}, fork_block: {:?}, ttd: {} }}",
+                        fork, activation_block_number, fork_block, total_difficulty);
+                }
+                _ => println!("  {:?} -> {:?}", fork, condition),
+            }
+        }
+
+        // Manual fork ID calculation to debug
+        println!("\nManual fork hash calculation:");
+        let mut manual_hash = ForkHash::from(PULSECHAIN_MAINNET.genesis_hash());
+        println!("  Start with genesis hash: {:?}", manual_hash);
+
+        // Add each block fork
+        for num in [1150000u64, 1920000, 2463000, 2675000, 4370000, 7280000, 9069000, 9200000, 12244000, 12965000, 13773000, 15050000, 17233000] {
+            manual_hash += num;
+            println!("  After adding block {}: {:?}", num, manual_hash);
+        }
+
+        // Add Shanghai timestamp
+        manual_hash += 1683786515u64;
+        println!("  After adding Shanghai timestamp 1683786515: {:?}", manual_hash);
+
+        // Test WITHOUT block 17233000 (in case peers don't have it)
+        println!("\nAlternative calculation WITHOUT block 17233000:");
+        let mut alt_hash = ForkHash::from(PULSECHAIN_MAINNET.genesis_hash());
+        for num in [1150000u64, 1920000, 2463000, 2675000, 4370000, 7280000, 9069000, 9200000, 12244000, 12965000, 13773000, 15050000] {
+            alt_hash += num;
+        }
+        println!("  After block forks (no 17233000): {:?}", alt_hash);
+        alt_hash += 1683786515u64;
+        println!("  After adding Shanghai: {:?}", alt_hash);
+
+        // Calculate fork ID at genesis (block 0)
+        let head = Head {
+            hash: PULSECHAIN_MAINNET.genesis_hash(),
+            number: 0,
+            timestamp: PULSECHAIN_MAINNET.genesis().timestamp,
+            difficulty: PULSECHAIN_MAINNET.genesis().difficulty,
+            total_difficulty: PULSECHAIN_MAINNET.genesis().difficulty,
+        };
+
+        let fork_id = PULSECHAIN_MAINNET.fork_id(&head);
+        println!("\nPulseChain Fork ID at block 0: {:?}", fork_id);
+
+        // Test at block 25M (past all forks including Shanghai)
+        let head_late = Head {
+            hash: PULSECHAIN_MAINNET.genesis_hash(),
+            number: 25_000_000,
+            timestamp: 1700000000, // Past Shanghai timestamp
+            difficulty: Default::default(),
+            total_difficulty: Default::default(),
+        };
+
+        let fork_id_late = PULSECHAIN_MAINNET.fork_id(&head_late);
+        println!("PulseChain Fork ID at block 25M: {:?}", fork_id_late);
+        println!("Expected PulseChain fork hash: 22d523b2");
+    }
 }

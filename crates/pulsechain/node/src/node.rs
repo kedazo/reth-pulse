@@ -3,7 +3,7 @@
 use reth_chainspec::ChainSpec;
 use reth_engine_local::LocalPayloadAttributesBuilder;
 use reth_ethereum::node::{
-    EthereumAddOns, EthereumConsensusBuilder, EthereumEngineValidatorBuilder,
+    EthereumAddOns, EthereumEngineValidatorBuilder,
     EthereumEthApiBuilder, EthereumNetworkBuilder, EthereumPayloadBuilder, EthereumPoolBuilder,
 };
 use reth_ethereum_engine_primitives::{
@@ -18,6 +18,7 @@ use reth_node_builder::{
 };
 use reth_payload_primitives::PayloadTypes;
 use reth_provider::{providers::ProviderFactoryBuilder, EthStorage};
+use reth_pulsechain_consensus::PulseChainConsensusBuilder;
 use reth_pulsechain_evm::PulseChainExecutorBuilder;
 use std::sync::Arc;
 
@@ -34,14 +35,15 @@ impl PulseChainNode {
     ///
     /// This configures:
     /// - Custom PulseChain executor (applies fork modifications at block 17,233,000)
-    /// - Standard Ethereum components for everything else (pool, network, consensus, payload)
+    /// - Custom PulseChain consensus (uses difficulty-based validation)
+    /// - Standard Ethereum components for everything else (pool, network, payload)
     pub fn components<Node>() -> ComponentsBuilder<
         Node,
         EthereumPoolBuilder,
         BasicPayloadServiceBuilder<EthereumPayloadBuilder>,
         EthereumNetworkBuilder,
         PulseChainExecutorBuilder,
-        EthereumConsensusBuilder,
+        PulseChainConsensusBuilder,
     >
     where
         Node: FullNodeTypes<Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>>,
@@ -57,7 +59,7 @@ impl PulseChainNode {
             .executor(PulseChainExecutorBuilder::default())
             .payload(BasicPayloadServiceBuilder::default())
             .network(EthereumNetworkBuilder::default())
-            .consensus(EthereumConsensusBuilder::default())
+            .consensus(PulseChainConsensusBuilder::default())
     }
 
     /// Instantiates the [`ProviderFactoryBuilder`] for a PulseChain node.
@@ -94,7 +96,7 @@ where
         BasicPayloadServiceBuilder<EthereumPayloadBuilder>,
         EthereumNetworkBuilder,
         PulseChainExecutorBuilder,
-        EthereumConsensusBuilder,
+        PulseChainConsensusBuilder,
     >;
 
     type AddOns =

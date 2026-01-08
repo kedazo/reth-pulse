@@ -9,6 +9,9 @@ pub use ethereum::*;
 mod optimism;
 pub use optimism::*;
 
+mod pulsechain;
+pub use pulsechain::*;
+
 /// Returns parsed mainnet nodes
 pub fn mainnet_nodes() -> Vec<NodeRecord> {
     parse_nodes(&MAINNET_BOOTNODES[..])

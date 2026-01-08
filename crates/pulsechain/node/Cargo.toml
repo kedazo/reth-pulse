@@ -24,6 +24,7 @@ reth-payload-primitives.workspace = true
 reth-provider.workspace = true
 
 # pulsechain
+reth-pulsechain-consensus.workspace = true
 reth-pulsechain-evm.workspace = true
 
 # alloy

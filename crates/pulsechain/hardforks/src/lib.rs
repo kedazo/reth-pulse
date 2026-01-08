@@ -33,8 +33,9 @@ use reth_ethereum_forks::{ChainHardforks, EthereumHardfork, ForkCondition, Hardf
 /// Note: Only Ethereum hardforks active at block 17,233,000 are included.
 /// Shanghai and later forks are PulseChain-specific activations.
 pub static PULSECHAIN_MAINNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
+    // PulseChain follows Ethereum mainnet history EXACTLY from block 0 to 17,233,000
+    // All Ethereum hardforks at their original block numbers
     ChainHardforks::new(vec![
-        // Pre-merge Ethereum hardforks (all by block number, matching Ethereum mainnet)
         (EthereumHardfork::Frontier.boxed(), ForkCondition::Block(0)),
         (EthereumHardfork::Homestead.boxed(), ForkCondition::Block(1_150_000)),
         (EthereumHardfork::Dao.boxed(), ForkCondition::Block(1_920_000)),
@@ -49,10 +50,7 @@ pub static PULSECHAIN_MAINNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::ne
         (EthereumHardfork::London.boxed(), ForkCondition::Block(12_965_000)),
         (EthereumHardfork::ArrowGlacier.boxed(), ForkCondition::Block(13_773_000)),
         (EthereumHardfork::GrayGlacier.boxed(), ForkCondition::Block(15_050_000)),
-        // Paris (The Merge) - Ethereum mainnet merged at block ~15.5M in Sept 2022
-        // PulseChain inherits Ethereum's PoS blocks from ~15.5M to 17,233,000
-        // TTD = Ethereum's last actual TTD (58_750_003_716_598_352_816_469) + 131_072
-        // The TTD offset allows PulseChain to have a temporary PoW block at the fork
+        // Paris at PrimordialPulse block (17,233,000) with custom TTD
         (
             EthereumHardfork::Paris.boxed(),
             ForkCondition::TTD {
@@ -61,8 +59,8 @@ pub static PULSECHAIN_MAINNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::ne
                 total_difficulty: PULSECHAIN_TTD,
             },
         ),
-        // Shanghai activated AFTER the fork on PulseChain (not on Ethereum pre-fork)
-        // This is a PulseChain-specific activation at timestamp 1683786515 (May 11, 2023)
+        // Shanghai: PulseChain uses its own activation timestamp (1683786515)
+        // Note: Pre-fork blocks inherited Ethereum's Shanghai, but this is handled in consensus validator
         (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(PULSECHAIN_SHANGHAI_TIME)),
     ])
 });
@@ -100,8 +98,15 @@ pub const PULSECHAIN_TTD: U256 = U256::from_limbs([
     0,
 ]);
 
-/// Shanghai activation timestamp on PulseChain
+/// Shanghai activation timestamp (inherited from Ethereum mainnet)
+/// April 12, 2023, 22:27:35 UTC
+/// This is Ethereum's Shanghai timestamp, which PulseChain inherited since the fork
+/// occurred after Shanghai was already active on Ethereum
+pub const ETHEREUM_SHANGHAI_TIME: u64 = 1681338455;
+
+/// PulseChain-specific Shanghai timestamp (unused - kept for reference)
 /// May 11, 2023, 06:01:55 UTC
+/// Note: Not used because PulseChain forked from Ethereum AFTER Shanghai was already active
 pub const PULSECHAIN_SHANGHAI_TIME: u64 = 1683786515;
 
 /// Helper function to determine if a block number is before the PrimordialPulse fork

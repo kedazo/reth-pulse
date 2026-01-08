@@ -10320,6 +10320,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "reth-pulsechain-consensus"
+version = "1.9.3"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "eyre",
+ "reth-chainspec",
+ "reth-consensus",
+ "reth-consensus-common",
+ "reth-ethereum-consensus",
+ "reth-ethereum-primitives",
+ "reth-execution-types",
+ "reth-node-api",
+ "reth-node-builder",
+ "reth-primitives",
+ "reth-primitives-traits",
+ "reth-pulsechain-chainspec",
+ "reth-pulsechain-forks",
+ "tracing",
+]
+
+[[package]]
 name = "reth-pulsechain-evm"
 version = "1.9.3"
 dependencies = [
@@ -10357,6 +10380,7 @@ dependencies = [
  "reth-node-builder",
  "reth-payload-primitives",
  "reth-provider",
+ "reth-pulsechain-consensus",
  "reth-pulsechain-evm",
 ]
 

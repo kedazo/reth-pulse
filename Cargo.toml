@@ -89,6 +89,7 @@ members = [
     "crates/optimism/txpool/",
     "crates/pulsechain/hardforks/",
     "crates/pulsechain/chainspec/",
+    "crates/pulsechain/consensus/",
     "crates/pulsechain/pulse/",
     "crates/pulsechain/evm/",
     "crates/pulsechain/node/",
@@ -430,6 +431,7 @@ reth-optimism-forks = { path = "crates/optimism/hardforks", default-features = f
 reth-optimism-payload-builder = { path = "crates/optimism/payload" }
 reth-pulsechain-forks = { path = "crates/pulsechain/hardforks", default-features = false }
 reth-pulsechain-chainspec = { path = "crates/pulsechain/chainspec", default-features = false }
+reth-pulsechain-consensus = { path = "crates/pulsechain/consensus", default-features = false }
 reth-pulsechain = { path = "crates/pulsechain/pulse", default-features = false }
 reth-pulsechain-evm = { path = "crates/pulsechain/evm", default-features = false }
 reth-pulsechain-node = { path = "crates/pulsechain/node", default-features = false }
