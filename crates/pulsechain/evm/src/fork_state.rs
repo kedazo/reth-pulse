@@ -16,21 +16,20 @@ use reth_ethereum::evm::{
         DatabaseCommit,
     },
 };
+use revm::Database;
 use reth_pulsechain::{DepositContractData, SacrificeCredit};
 use revm::{
     bytecode::Bytecode,
-    primitives::{address, keccak256},
+    primitives::keccak256,
 };
-
-/// Dummy system address for fork state modifications
-pub(crate) const SYSTEM_ADDRESS: Address = address!("0xfffffffffffffffffffffffffffffffffffffffe");
 
 /// Apply sacrifice credits to state
 ///
 /// For each credit, adds the credit amount to the address balance.
 /// Creates the account if it doesn't exist.
 ///
-/// This is implemented using system calls to properly handle state merging.
+/// This loads existing accounts from the database, adds the credit to their balance,
+/// and commits all changes at once.
 pub(crate) fn apply_sacrifice_credits<E>(
     evm: &mut E,
     credits: &[SacrificeCredit],
@@ -38,45 +37,47 @@ pub(crate) fn apply_sacrifice_credits<E>(
 where
     E: Evm,
     E::Error: Display,
-    E::DB: DatabaseCommit,
+    E::DB: Database + DatabaseCommit,
 {
     tracing::info!(count = credits.len(), "Applying sacrifice credits");
 
-    // For each credit, execute a value transfer from system address
-    // This properly handles loading existing account state and merging changes
+    let mut changes = HashMap::default();
+
+    // For each credit, load existing account state and add balance
     for credit in credits {
-        let mut state = match evm.transact_system_call(
-            SYSTEM_ADDRESS,
+        // Load existing account info from database (or get default if account doesn't exist)
+        let existing_info = evm
+            .db_mut()
+            .basic(credit.address)
+            .map_err(|e| {
+                BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                    format!("Failed to load account {:?}: {}", credit.address, e).into(),
+                ))
+            })?
+            .unwrap_or_default();
+
+        // Calculate new balance (existing + credit)
+        let new_balance = existing_info.balance + credit.credit;
+
+        // Create account change with updated balance
+        changes.insert(
             credit.address,
-            Bytes::new(), // Empty calldata - just a value transfer
-        ) {
-            Ok(res) => res.state,
-            Err(e) => {
-                return Err(BlockExecutionError::Internal(InternalBlockExecutionError::Other(
-                    format!("Failed to apply credit to {:?}: {}", credit.address, e).into(),
-                )))
-            }
-        };
-
-        // The system call creates the state change for the transfer
-        // Now we need to manually add the balance since this is a mint, not a transfer
-        // Remove the system address (it shouldn't lose balance)
-        state.remove(&SYSTEM_ADDRESS);
-
-        // Get or create the account entry for the credit recipient
-        let account = state.entry(credit.address).or_insert_with(|| Account {
-            info: AccountInfo::default(),
-            transaction_id: 0,
-            storage: HashMap::default(),
-            status: AccountStatus::Touched,
-        });
-
-        // Add the credit amount to the balance
-        account.info.balance += credit.credit;
-        account.status |= AccountStatus::Touched;
-
-        evm.db_mut().commit(state);
+            Account {
+                info: AccountInfo {
+                    balance: new_balance,
+                    nonce: existing_info.nonce,
+                    code_hash: existing_info.code_hash,
+                    code: existing_info.code.clone(),
+                },
+                transaction_id: 0,
+                storage: HashMap::default(), // Don't modify storage
+                status: AccountStatus::Touched,
+            },
+        );
     }
+
+    // Commit all changes at once
+    evm.db_mut().commit(changes);
 
     Ok(())
 }
@@ -100,7 +101,7 @@ pub(crate) fn replace_deposit_contract<E>(
 where
     E: Evm,
     E::Error: Display,
-    E::DB: DatabaseCommit,
+    E::DB: Database + DatabaseCommit,
 {
     tracing::info!(
         eth_deposit = ?eth_deposit,
@@ -110,7 +111,17 @@ where
 
     let mut changes = HashMap::default();
 
-    // 1. Self-destruct Ethereum deposit contract and replace with nil contract
+    // 1. Load existing Ethereum deposit contract (to properly handle existing state)
+    let _eth_existing = evm
+        .db_mut()
+        .basic(eth_deposit)
+        .map_err(|e| {
+            BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                format!("Failed to load Ethereum deposit contract {:?}: {}", eth_deposit, e).into(),
+            ))
+        })?;
+
+    // Replace with nil contract (self-destruct)
     let nil_code = Bytecode::new_legacy(nil_bytecode.clone());
     let nil_hash = keccak256(nil_bytecode);
 
@@ -129,7 +140,17 @@ where
         },
     );
 
-    // 2. Deploy PulseChain deposit contract
+    // 2. Load existing PulseChain deposit contract (if any)
+    let _pulse_existing = evm
+        .db_mut()
+        .basic(pulse_deposit)
+        .map_err(|e| {
+            BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                format!("Failed to load PulseChain deposit contract {:?}: {}", pulse_deposit, e).into(),
+            ))
+        })?;
+
+    // Deploy PulseChain deposit contract
     let pulse_code = Bytecode::new_legacy(deposit_data.bytecode.clone());
     let pulse_hash = keccak256(&deposit_data.bytecode);
 

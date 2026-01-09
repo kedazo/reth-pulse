@@ -74,8 +74,17 @@ pub static PULSECHAIN_MAINNET: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
         // Genesis header uses Ethereum's genesis hash (PulseChain shares Ethereum's genesis)
         genesis_header: SealedHeader::new(genesis_header, PULSECHAIN_GENESIS_HASH),
         genesis,
-        // Paris activated at PrimordialPulse block with custom TTD
-        paris_block_and_final_difficulty: Some((PULSECHAIN_PRIMORDIAL_BLOCK, PULSECHAIN_TTD)),
+        // Paris activated at Ethereum's merge (block 15,537,394)
+        // PulseChain inherited this since the fork happened after the merge
+        paris_block_and_final_difficulty: Some((
+            15_537_394,
+            alloy_primitives::U256::from_limbs([
+                (ETHEREUM_MAINNET_TTD & 0xFFFFFFFFFFFFFFFF) as u64,
+                (ETHEREUM_MAINNET_TTD >> 64) as u64,
+                0,
+                0,
+            ]),
+        )),
         hardforks,
         // PulseChain deposit contract
         deposit_contract: Some(*PULSECHAIN_DEPOSIT_CONTRACT),
@@ -134,11 +143,12 @@ mod tests {
             .fork(EthereumHardfork::Paris)
             .active_at_block(PULSECHAIN_PRIMORDIAL_BLOCK));
 
-        // Verify Shanghai is active after its timestamp
+        // Verify Shanghai is active after Ethereum's timestamp
+        // (PulseChain forked after Shanghai was already active)
         assert!(spec
             .hardforks
             .fork(EthereumHardfork::Shanghai)
-            .active_at_timestamp(PULSECHAIN_SHANGHAI_TIME));
+            .active_at_timestamp(ETHEREUM_SHANGHAI_TIME));
     }
 
     #[test]
@@ -150,8 +160,17 @@ mod tests {
     fn test_pulsechain_paris_block() {
         let (block, ttd) =
             PULSECHAIN_MAINNET.paris_block_and_final_difficulty.expect("Paris block should be set");
-        assert_eq!(block, PULSECHAIN_PRIMORDIAL_BLOCK);
-        assert_eq!(ttd, PULSECHAIN_TTD);
+        // Paris activated at Ethereum's merge (block 15,537,394), not at PrimordialPulse
+        assert_eq!(block, 15_537_394);
+        assert_eq!(
+            ttd,
+            alloy_primitives::U256::from_limbs([
+                (ETHEREUM_MAINNET_TTD & 0xFFFFFFFFFFFFFFFF) as u64,
+                (ETHEREUM_MAINNET_TTD >> 64) as u64,
+                0,
+                0,
+            ])
+        );
     }
 
     #[test]
