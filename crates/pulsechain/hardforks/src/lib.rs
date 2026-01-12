@@ -14,10 +14,40 @@
 
 extern crate alloc;
 
-use alloc::vec;
+use alloc::{boxed::Box, vec};
 use alloy_primitives::U256;
+use core::fmt;
 use once_cell::sync::Lazy as LazyLock;
 use reth_ethereum_forks::{ChainHardforks, EthereumHardfork, ForkCondition, Hardfork};
+
+/// PulseChain-specific hardfork
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PulseChainHardfork {
+    /// PrimordialPulse fork at block 17,233,000
+    ///
+    /// This is the block where PulseChain forks from Ethereum mainnet.
+    /// At this block:
+    /// - Chain ID changes from 1 (Ethereum) to 369 (PulseChain)
+    /// - Sacrifice credits are applied to accounts
+    /// - Deposit contracts are replaced
+    PrimordialPulse,
+}
+
+impl fmt::Display for PulseChainHardfork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", match self {
+            Self::PrimordialPulse => "PrimordialPulse",
+        })
+    }
+}
+
+impl Hardfork for PulseChainHardfork {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::PrimordialPulse => "PrimordialPulse",
+        }
+    }
+}
 
 /// PulseChain mainnet list of hardforks.
 ///
@@ -66,9 +96,13 @@ pub static PULSECHAIN_MAINNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::ne
                 ]),
             },
         ),
-        // Shanghai: Blocks before PrimordialPulse (17,233,000) follow Ethereum's Shanghai timestamp
-        // Ethereum's Shanghai: April 12, 2023 at timestamp 1681338455
-        // PulseChain forked AFTER Shanghai was already active, so we use Ethereum's timestamp
+        // PrimordialPulse fork at block 17,233,000
+        // This is the actual fork point where PulseChain diverges from Ethereum
+        // CRITICAL: This must be included for correct fork ID calculation
+        (Box::new(PulseChainHardfork::PrimordialPulse), ForkCondition::Block(PULSECHAIN_PRIMORDIAL_BLOCK)),
+        // Shanghai: Ethereum's Shanghai timestamp (April 12, 2023)
+        // This timestamp was already active when PulseChain forked, so we use Ethereum's time
+        // CRITICAL: This must come AFTER PrimordialPulse in the list for correct fork ID
         (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(ETHEREUM_SHANGHAI_TIME)),
     ])
 });
@@ -198,5 +232,14 @@ mod tests {
         assert!(hardforks
             .fork(EthereumHardfork::Shanghai)
             .active_at_timestamp(ETHEREUM_SHANGHAI_TIME));
+    }
+
+    #[test]
+    fn test_primordial_pulse_hardfork() {
+        let hardforks = &*PULSECHAIN_MAINNET_HARDFORKS;
+
+        // Verify PrimordialPulse fork exists and is at the correct block
+        assert!(hardforks.fork(PulseChainHardfork::PrimordialPulse).active_at_block(17_233_000));
+        assert!(!hardforks.fork(PulseChainHardfork::PrimordialPulse).active_at_block(17_232_999));
     }
 }
