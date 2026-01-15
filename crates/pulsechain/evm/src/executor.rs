@@ -7,7 +7,7 @@
 //! The approach demonstrated here shows the structure, but the actual state
 //! modification methods need to be verified against the current revm API.
 
-use alloc::{boxed::Box, format, sync::Arc};
+use alloc::{boxed::Box, format, sync::Arc, vec::Vec};
 use revm::Database as RevmDatabase;
 use alloy_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor, ExecutableTx},
