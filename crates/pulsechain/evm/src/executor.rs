@@ -8,6 +8,7 @@
 //! modification methods need to be verified against the current revm API.
 
 use alloc::{boxed::Box, format, sync::Arc};
+use revm::Database as RevmDatabase;
 use alloy_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor, ExecutableTx},
     eth::{EthBlockExecutionCtx, EthBlockExecutor},
@@ -194,6 +195,223 @@ pub struct PulseChainBlockExecutor<'a, Evm> {
     block_number: u64,
 }
 
+impl<'db, DB, E> PulseChainBlockExecutor<'_, E>
+where
+    DB: Database + 'db,
+    E: Evm<DB = &'db mut State<DB>, Tx = TxEnv>,
+{
+    /// Verify that PrimordialPulse fork modifications were actually applied to state.
+    ///
+    /// This performs sanity checks to ensure:
+    /// 1. Sample sacrifice credits were applied (checks first 3 addresses)
+    /// 2. PulseChain deposit contract was deployed
+    /// 3. Ethereum deposit contract was replaced
+    ///
+    /// If verification fails, returns an error to stop execution and prevent
+    /// continuing with corrupted state.
+    fn verify_fork_modifications(
+        &mut self,
+        fork: &reth_pulsechain::PrimordialPulseFork,
+    ) -> Result<(), BlockExecutionError> {
+
+        tracing::info!("Verifying PrimordialPulse fork modifications...");
+
+        // Verify first 3 sacrifice credits were applied (sample check)
+        // Use State::basic() which reads from cache (not database.basic() which bypasses cache)
+        let sample_count = 3.min(fork.sacrifice_credits.len());
+        for (idx, credit) in fork.sacrifice_credits.iter().take(sample_count).enumerate() {
+            let account = self.inner.evm_mut().db_mut().basic(credit.address).map_err(|e| {
+                BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                    format!("Failed to read account {:?} for verification: {}", credit.address, e)
+                        .into(),
+                ))
+            })?;
+
+            if let Some(account_info) = account {
+                if account_info.balance < credit.credit {
+                    return Err(BlockExecutionError::Internal(
+                        InternalBlockExecutionError::Other(
+                            format!(
+                                "FORK VERIFICATION FAILED: Sacrifice credit #{} for address {:?} \
+                                 was not applied correctly. Expected balance >= {}, got {}",
+                                idx, credit.address, credit.credit, account_info.balance
+                            )
+                            .into(),
+                        ),
+                    ));
+                }
+                tracing::debug!(
+                    address = ?credit.address,
+                    balance = %account_info.balance,
+                    credit = %credit.credit,
+                    "Verified sacrifice credit #{}", idx
+                );
+            } else {
+                return Err(BlockExecutionError::Internal(
+                    InternalBlockExecutionError::Other(
+                        format!(
+                            "FORK VERIFICATION FAILED: Sacrifice credit #{} for address {:?} \
+                             was not applied - account does not exist",
+                            idx, credit.address
+                        )
+                        .into(),
+                    ),
+                ));
+            }
+        }
+
+        // Verify PulseChain deposit contract was deployed
+        let pulse_deposit_account =
+            self.inner.evm_mut().db_mut().basic(fork.pulsechain_deposit_contract).map_err(|e| {
+                BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                    format!(
+                        "Failed to read PulseChain deposit contract {:?} for verification: {}",
+                        fork.pulsechain_deposit_contract, e
+                    )
+                    .into(),
+                ))
+            })?;
+
+        if let Some(account_info) = pulse_deposit_account {
+            if account_info.code.is_none() || account_info.code_hash.is_zero() {
+                return Err(BlockExecutionError::Internal(
+                    InternalBlockExecutionError::Other(
+                        format!(
+                            "FORK VERIFICATION FAILED: PulseChain deposit contract at {:?} \
+                             has no code deployed",
+                            fork.pulsechain_deposit_contract
+                        )
+                        .into(),
+                    ),
+                ));
+            }
+
+            // Verify the code hash matches expected
+            let expected_code_hash = revm::primitives::keccak256(&fork.deposit_contract_data.bytecode);
+            if account_info.code_hash != expected_code_hash {
+                return Err(BlockExecutionError::Internal(
+                    InternalBlockExecutionError::Other(
+                        format!(
+                            "FORK VERIFICATION FAILED: PulseChain deposit contract at {:?} \
+                             has wrong code hash. Expected {:?}, got {:?}",
+                            fork.pulsechain_deposit_contract, expected_code_hash, account_info.code_hash
+                        )
+                        .into(),
+                    ),
+                ));
+            }
+
+            tracing::debug!(
+                address = ?fork.pulsechain_deposit_contract,
+                code_hash = ?account_info.code_hash,
+                "Verified PulseChain deposit contract deployed with correct code"
+            );
+        } else {
+            return Err(BlockExecutionError::Internal(
+                InternalBlockExecutionError::Other(
+                    format!(
+                        "FORK VERIFICATION FAILED: PulseChain deposit contract at {:?} \
+                         does not exist",
+                        fork.pulsechain_deposit_contract
+                    )
+                    .into(),
+                ),
+            ));
+        }
+
+        // Verify PulseChain deposit contract storage was initialized
+        // Check a sample of critical storage slots
+        let storage_slot_count = fork.deposit_contract_data.storage.len();
+        let sample_slots: Vec<_> = fork.deposit_contract_data.storage.iter().take(3).collect();
+
+        for (slot, expected_value) in &sample_slots {
+            let storage_value = self.inner.evm_mut().db_mut()
+                .storage(fork.pulsechain_deposit_contract, *slot)
+                .map_err(|e| {
+                    BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                        format!(
+                            "Failed to read storage slot {:?} for PulseChain deposit contract: {}",
+                            slot, e
+                        )
+                        .into(),
+                    ))
+                })?;
+
+            let expected_u256 = alloy_primitives::U256::from_be_bytes(expected_value.0);
+            if storage_value != expected_u256 {
+                return Err(BlockExecutionError::Internal(
+                    InternalBlockExecutionError::Other(
+                        format!(
+                            "FORK VERIFICATION FAILED: PulseChain deposit contract storage \
+                             slot {:?} has wrong value. Expected {:?}, got {:?}",
+                            slot, expected_u256, storage_value
+                        )
+                        .into(),
+                    ),
+                ));
+            }
+        }
+
+        tracing::debug!(
+            address = ?fork.pulsechain_deposit_contract,
+            total_slots = storage_slot_count,
+            verified_slots = sample_slots.len(),
+            "Verified PulseChain deposit contract storage initialized"
+        );
+
+        // Verify Ethereum deposit contract was replaced with nil contract
+        let eth_deposit_account =
+            self.inner.evm_mut().db_mut().basic(fork.ethereum_deposit_contract).map_err(|e| {
+                BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                    format!(
+                        "Failed to read Ethereum deposit contract {:?} for verification: {}",
+                        fork.ethereum_deposit_contract, e
+                    )
+                    .into(),
+                ))
+            })?;
+
+        if let Some(account_info) = eth_deposit_account {
+            // Verify it has the nil contract code hash
+            let nil_hash = revm::primitives::keccak256(&fork.nil_contract_bytecode);
+            if account_info.code_hash != nil_hash {
+                return Err(BlockExecutionError::Internal(
+                    InternalBlockExecutionError::Other(
+                        format!(
+                            "FORK VERIFICATION FAILED: Ethereum deposit contract at {:?} \
+                             was not replaced with nil contract. Expected code hash {:?}, got {:?}",
+                            fork.ethereum_deposit_contract, nil_hash, account_info.code_hash
+                        )
+                        .into(),
+                    ),
+                ));
+            }
+            tracing::debug!(
+                address = ?fork.ethereum_deposit_contract,
+                code_hash = ?account_info.code_hash,
+                "Verified Ethereum deposit contract replaced"
+            );
+        } else {
+            return Err(BlockExecutionError::Internal(
+                InternalBlockExecutionError::Other(
+                    format!(
+                        "FORK VERIFICATION FAILED: Ethereum deposit contract at {:?} \
+                         does not exist after replacement",
+                        fork.ethereum_deposit_contract
+                    )
+                    .into(),
+                ),
+            ));
+        }
+
+        tracing::info!(
+            "✓ PrimordialPulse fork verification PASSED - all modifications confirmed in state"
+        );
+
+        Ok(())
+    }
+}
+
 impl<'db, DB, E> BlockExecutor for PulseChainBlockExecutor<'_, E>
 where
     DB: Database + 'db,
@@ -231,6 +449,39 @@ where
             )?;
 
             tracing::info!("PrimordialPulse fork modifications applied successfully");
+
+            // CRITICAL VERIFICATION: Verify fork modifications were actually applied
+            // This prevents continuing with corrupted state if modifications failed
+            self.verify_fork_modifications(&fork)?;
+        } else if self.block_number == PULSECHAIN_PRIMORDIAL_BLOCK + 1 {
+            // CRITICAL: Verify fork was applied in previous block
+            // This catches the case where the fork block was skipped or not executed
+            tracing::info!(
+                block = self.block_number,
+                "Verifying PrimordialPulse fork was applied in previous block"
+            );
+
+            let fork = get_primordial_pulse_fork().map_err(|e| {
+                BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                    format!("Failed to get fork data: {e}").into(),
+                ))
+            })?;
+
+            self.verify_fork_modifications(&fork).map_err(|e| {
+                BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                    format!(
+                        "CRITICAL: Fork verification failed at block {}. \
+                         The PrimordialPulse fork at block {} was NOT applied correctly! \
+                         Original error: {}",
+                        self.block_number, PULSECHAIN_PRIMORDIAL_BLOCK, e
+                    )
+                    .into(),
+                ))
+            })?;
+
+            tracing::info!(
+                "✓ Confirmed: PrimordialPulse fork was correctly applied in previous block"
+            );
         }
 
         self.inner.apply_pre_execution_changes()

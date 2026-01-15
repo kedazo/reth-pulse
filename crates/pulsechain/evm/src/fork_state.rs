@@ -3,81 +3,71 @@
 //! This module contains the actual implementation of state modifications
 //! for the PrimordialPulse fork.
 
-use alloc::format;
+use alloc::{format, vec::Vec};
 use alloy_primitives::{map::HashMap, Address, Bytes, U256};
 use core::fmt::Display;
-use reth_ethereum::evm::{
-    primitives::{
-        execute::{BlockExecutionError, InternalBlockExecutionError},
-        Evm,
-    },
-    revm::{
-        state::{Account, AccountInfo, AccountStatus, EvmStorageSlot},
-        DatabaseCommit,
-    },
+use reth_ethereum::evm::primitives::{
+    execute::{BlockExecutionError, InternalBlockExecutionError},
+    Evm,
 };
-use revm::Database;
-use reth_pulsechain::{DepositContractData, SacrificeCredit};
 use revm::{
     bytecode::Bytecode,
+    database::State,
     primitives::keccak256,
+    state::{Account, AccountInfo, AccountStatus, EvmStorageSlot},
+    Database, DatabaseCommit,
 };
+use reth_pulsechain::{DepositContractData, SacrificeCredit};
 
 /// Apply sacrifice credits to state
 ///
 /// For each credit, adds the credit amount to the address balance.
 /// Creates the account if it doesn't exist.
 ///
-/// This loads existing accounts from the database, adds the credit to their balance,
-/// and commits all changes at once.
-pub(crate) fn apply_sacrifice_credits<E>(
+/// This uses `State::increment_balances()` which properly creates transitions
+/// that are tracked in the bundle state and will be persisted to the database.
+pub(crate) fn apply_sacrifice_credits<'db, E, DB>(
     evm: &mut E,
     credits: &[SacrificeCredit],
 ) -> Result<(), BlockExecutionError>
 where
-    E: Evm,
+    E: Evm<DB = &'db mut State<DB>>,
     E::Error: Display,
-    E::DB: Database + DatabaseCommit,
+    DB: Database + 'db,
 {
     tracing::info!(count = credits.len(), "Applying sacrifice credits");
 
-    let mut changes = HashMap::default();
+    // Get access to the state database
+    let state: &mut State<DB> = evm.db_mut();
 
-    // For each credit, load existing account state and add balance
-    for credit in credits {
-        // Load existing account info from database (or get default if account doesn't exist)
-        let existing_info = evm
-            .db_mut()
-            .basic(credit.address)
-            .map_err(|e| {
-                BlockExecutionError::Internal(InternalBlockExecutionError::Other(
-                    format!("Failed to load account {:?}: {}", credit.address, e).into(),
-                ))
-            })?
-            .unwrap_or_default();
+    // Convert credits to (Address, u128) pairs for increment_balances
+    // Note: We assume all credits fit in u128. If any credit exceeds u128::MAX,
+    // this will truncate. In practice, all sacrifice credits fit in u128.
+    let balance_increments: Vec<(Address, u128)> = credits
+        .iter()
+        .map(|credit| {
+            // Convert U256 to u128, saturating at u128::MAX if needed
+            let amount: u128 = credit.credit.try_into().unwrap_or_else(|_| {
+                tracing::warn!(
+                    address = ?credit.address,
+                    credit = ?credit.credit,
+                    "Sacrifice credit exceeds u128::MAX, using saturated value"
+                );
+                u128::MAX
+            });
+            (credit.address, amount)
+        })
+        .collect();
 
-        // Calculate new balance (existing + credit)
-        let new_balance = existing_info.balance + credit.credit;
+    // Use State::increment_balances which properly creates transitions
+    // This ensures changes are tracked in the bundle state
+    state.increment_balances(balance_increments).map_err(|e| {
+        BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+            format!("Failed to apply sacrifice credits: {}", e).into(),
+        ))
+    })?;
 
-        // Create account change with updated balance
-        changes.insert(
-            credit.address,
-            Account {
-                info: AccountInfo {
-                    balance: new_balance,
-                    nonce: existing_info.nonce,
-                    code_hash: existing_info.code_hash,
-                    code: existing_info.code.clone(),
-                },
-                transaction_id: 0,
-                storage: HashMap::default(), // Don't modify storage
-                status: AccountStatus::Touched,
-            },
-        );
-    }
-
-    // Commit all changes at once
-    evm.db_mut().commit(changes);
+    tracing::info!("Sacrifice credits applied successfully");
 
     Ok(())
 }
@@ -85,13 +75,12 @@ where
 /// Replace Ethereum deposit contract with PulseChain deposit contract
 ///
 /// Steps:
-/// 1. Self-destruct Ethereum deposit contract
-/// 2. Set Ethereum deposit contract code to nil contract
-/// 3. Clear balance on PulseChain deposit contract
-/// 4. Deploy PulseChain deposit contract bytecode
-/// 5. Set nonce to 0
-/// 6. Initialize 31 storage slots (0x22-0x40)
-pub(crate) fn replace_deposit_contract<E>(
+/// 1. Self-destruct Ethereum deposit contract and replace with nil contract
+/// 2. Deploy PulseChain deposit contract bytecode with initialized storage
+///
+/// This uses `DatabaseCommit::commit()` which properly creates transitions
+/// that are tracked in the bundle state and will be persisted to the database.
+pub(crate) fn replace_deposit_contract<'db, E, DB>(
     evm: &mut E,
     eth_deposit: Address,
     nil_bytecode: &Bytes,
@@ -99,9 +88,9 @@ pub(crate) fn replace_deposit_contract<E>(
     deposit_data: &DepositContractData,
 ) -> Result<(), BlockExecutionError>
 where
-    E: Evm,
+    E: Evm<DB = &'db mut State<DB>>,
     E::Error: Display,
-    E::DB: Database + DatabaseCommit,
+    DB: Database + 'db,
 {
     tracing::info!(
         eth_deposit = ?eth_deposit,
@@ -109,19 +98,13 @@ where
         "Replacing deposit contract"
     );
 
-    let mut changes = HashMap::default();
+    // Get access to the state database
+    let state: &mut State<DB> = evm.db_mut();
 
-    // 1. Load existing Ethereum deposit contract (to properly handle existing state)
-    let _eth_existing = evm
-        .db_mut()
-        .basic(eth_deposit)
-        .map_err(|e| {
-            BlockExecutionError::Internal(InternalBlockExecutionError::Other(
-                format!("Failed to load Ethereum deposit contract {:?}: {}", eth_deposit, e).into(),
-            ))
-        })?;
+    // Build changes to commit
+    let mut changes: HashMap<Address, Account> = HashMap::default();
 
-    // Replace with nil contract (self-destruct)
+    // 1. Replace Ethereum deposit contract with nil contract
     let nil_code = Bytecode::new_legacy(nil_bytecode.clone());
     let nil_hash = keccak256(nil_bytecode);
 
@@ -134,30 +117,30 @@ where
                 code_hash: nil_hash,
                 code: Some(nil_code),
             },
+            storage: HashMap::default(), // Clear all storage
+            status: AccountStatus::SelfDestructed | AccountStatus::Touched,
             transaction_id: 0,
-            storage: HashMap::default(), // Clear storage
-            status: AccountStatus::Touched | AccountStatus::SelfDestructed,
         },
     );
 
-    // 2. Load existing PulseChain deposit contract (if any)
-    let _pulse_existing = evm
-        .db_mut()
-        .basic(pulse_deposit)
-        .map_err(|e| {
-            BlockExecutionError::Internal(InternalBlockExecutionError::Other(
-                format!("Failed to load PulseChain deposit contract {:?}: {}", pulse_deposit, e).into(),
-            ))
-        })?;
-
-    // Deploy PulseChain deposit contract
+    // 2. Deploy PulseChain deposit contract
     let pulse_code = Bytecode::new_legacy(deposit_data.bytecode.clone());
     let pulse_hash = keccak256(&deposit_data.bytecode);
 
     // Initialize storage from deposit data
-    let mut pulse_storage = HashMap::default();
+    // Use EvmStorageSlot with original_value = 0 (slot didn't exist before)
+    // and present_value = the value we want to set
+    let mut pulse_storage: HashMap<U256, EvmStorageSlot> = HashMap::default();
     for (slot, value) in &deposit_data.storage {
-        pulse_storage.insert(*slot, EvmStorageSlot::new((*value).into(), 0));
+        pulse_storage.insert(
+            *slot,
+            EvmStorageSlot {
+                original_value: U256::ZERO,
+                present_value: U256::from_be_bytes(value.0),
+                transaction_id: 0,
+                is_cold: false,
+            },
+        );
     }
 
     changes.insert(
@@ -169,14 +152,16 @@ where
                 code_hash: pulse_hash,
                 code: Some(pulse_code),
             },
-            transaction_id: 0,
             storage: pulse_storage,
-            status: AccountStatus::Touched | AccountStatus::Created,
+            status: AccountStatus::Created | AccountStatus::Touched,
+            transaction_id: 0,
         },
     );
 
-    // Commit all changes at once
-    evm.db_mut().commit(changes);
+    // Commit changes using DatabaseCommit which properly creates transitions
+    state.commit(changes);
+
+    tracing::info!("Deposit contract replacement committed successfully");
 
     Ok(())
 }
