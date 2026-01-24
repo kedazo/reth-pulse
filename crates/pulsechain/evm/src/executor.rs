@@ -8,7 +8,6 @@
 //! modification methods need to be verified against the current revm API.
 
 use alloc::{boxed::Box, format, sync::Arc, vec::Vec};
-use revm::Database as RevmDatabase;
 use alloy_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor, ExecutableTx},
     eth::{EthBlockExecutionCtx, EthBlockExecutor},
@@ -38,6 +37,7 @@ use reth_ethereum::{
 };
 use reth_pulsechain::get_primordial_pulse_fork;
 use reth_pulsechain_forks::{get_effective_chain_id, PULSECHAIN_PRIMORDIAL_BLOCK};
+use revm::Database as RevmDatabase;
 
 use crate::fork_state::{apply_sacrifice_credits, replace_deposit_contract};
 
@@ -213,7 +213,6 @@ where
         &mut self,
         fork: &reth_pulsechain::PrimordialPulseFork,
     ) -> Result<(), BlockExecutionError> {
-
         tracing::info!("Verifying PrimordialPulse fork modifications...");
 
         // Verify first 3 sacrifice credits were applied (sample check)
@@ -229,16 +228,14 @@ where
 
             if let Some(account_info) = account {
                 if account_info.balance < credit.credit {
-                    return Err(BlockExecutionError::Internal(
-                        InternalBlockExecutionError::Other(
-                            format!(
-                                "FORK VERIFICATION FAILED: Sacrifice credit #{} for address {:?} \
+                    return Err(BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                        format!(
+                            "FORK VERIFICATION FAILED: Sacrifice credit #{} for address {:?} \
                                  was not applied correctly. Expected balance >= {}, got {}",
-                                idx, credit.address, credit.credit, account_info.balance
-                            )
-                            .into(),
-                        ),
-                    ));
+                            idx, credit.address, credit.credit, account_info.balance
+                        )
+                        .into(),
+                    )));
                 }
                 tracing::debug!(
                     address = ?credit.address,
@@ -247,16 +244,14 @@ where
                     "Verified sacrifice credit #{}", idx
                 );
             } else {
-                return Err(BlockExecutionError::Internal(
-                    InternalBlockExecutionError::Other(
-                        format!(
-                            "FORK VERIFICATION FAILED: Sacrifice credit #{} for address {:?} \
+                return Err(BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                    format!(
+                        "FORK VERIFICATION FAILED: Sacrifice credit #{} for address {:?} \
                              was not applied - account does not exist",
-                            idx, credit.address
-                        )
-                        .into(),
-                    ),
-                ));
+                        idx, credit.address
+                    )
+                    .into(),
+                )));
             }
         }
 
@@ -274,31 +269,30 @@ where
 
         if let Some(account_info) = pulse_deposit_account {
             if account_info.code.is_none() || account_info.code_hash.is_zero() {
-                return Err(BlockExecutionError::Internal(
-                    InternalBlockExecutionError::Other(
-                        format!(
-                            "FORK VERIFICATION FAILED: PulseChain deposit contract at {:?} \
+                return Err(BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                    format!(
+                        "FORK VERIFICATION FAILED: PulseChain deposit contract at {:?} \
                              has no code deployed",
-                            fork.pulsechain_deposit_contract
-                        )
-                        .into(),
-                    ),
-                ));
+                        fork.pulsechain_deposit_contract
+                    )
+                    .into(),
+                )));
             }
 
             // Verify the code hash matches expected
-            let expected_code_hash = revm::primitives::keccak256(&fork.deposit_contract_data.bytecode);
+            let expected_code_hash =
+                revm::primitives::keccak256(&fork.deposit_contract_data.bytecode);
             if account_info.code_hash != expected_code_hash {
-                return Err(BlockExecutionError::Internal(
-                    InternalBlockExecutionError::Other(
-                        format!(
-                            "FORK VERIFICATION FAILED: PulseChain deposit contract at {:?} \
+                return Err(BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                    format!(
+                        "FORK VERIFICATION FAILED: PulseChain deposit contract at {:?} \
                              has wrong code hash. Expected {:?}, got {:?}",
-                            fork.pulsechain_deposit_contract, expected_code_hash, account_info.code_hash
-                        )
-                        .into(),
-                    ),
-                ));
+                        fork.pulsechain_deposit_contract,
+                        expected_code_hash,
+                        account_info.code_hash
+                    )
+                    .into(),
+                )));
             }
 
             tracing::debug!(
@@ -307,16 +301,14 @@ where
                 "Verified PulseChain deposit contract deployed with correct code"
             );
         } else {
-            return Err(BlockExecutionError::Internal(
-                InternalBlockExecutionError::Other(
-                    format!(
-                        "FORK VERIFICATION FAILED: PulseChain deposit contract at {:?} \
+            return Err(BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                format!(
+                    "FORK VERIFICATION FAILED: PulseChain deposit contract at {:?} \
                          does not exist",
-                        fork.pulsechain_deposit_contract
-                    )
-                    .into(),
-                ),
-            ));
+                    fork.pulsechain_deposit_contract
+                )
+                .into(),
+            )));
         }
 
         // Verify PulseChain deposit contract storage was initialized
@@ -325,7 +317,10 @@ where
         let sample_slots: Vec<_> = fork.deposit_contract_data.storage.iter().take(3).collect();
 
         for (slot, expected_value) in &sample_slots {
-            let storage_value = self.inner.evm_mut().db_mut()
+            let storage_value = self
+                .inner
+                .evm_mut()
+                .db_mut()
                 .storage(fork.pulsechain_deposit_contract, *slot)
                 .map_err(|e| {
                     BlockExecutionError::Internal(InternalBlockExecutionError::Other(
@@ -339,16 +334,14 @@ where
 
             let expected_u256 = alloy_primitives::U256::from_be_bytes(expected_value.0);
             if storage_value != expected_u256 {
-                return Err(BlockExecutionError::Internal(
-                    InternalBlockExecutionError::Other(
-                        format!(
-                            "FORK VERIFICATION FAILED: PulseChain deposit contract storage \
+                return Err(BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                    format!(
+                        "FORK VERIFICATION FAILED: PulseChain deposit contract storage \
                              slot {:?} has wrong value. Expected {:?}, got {:?}",
-                            slot, expected_u256, storage_value
-                        )
-                        .into(),
-                    ),
-                ));
+                        slot, expected_u256, storage_value
+                    )
+                    .into(),
+                )));
             }
         }
 
@@ -375,16 +368,14 @@ where
             // Verify it has the nil contract code hash
             let nil_hash = revm::primitives::keccak256(&fork.nil_contract_bytecode);
             if account_info.code_hash != nil_hash {
-                return Err(BlockExecutionError::Internal(
-                    InternalBlockExecutionError::Other(
-                        format!(
-                            "FORK VERIFICATION FAILED: Ethereum deposit contract at {:?} \
+                return Err(BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                    format!(
+                        "FORK VERIFICATION FAILED: Ethereum deposit contract at {:?} \
                              was not replaced with nil contract. Expected code hash {:?}, got {:?}",
-                            fork.ethereum_deposit_contract, nil_hash, account_info.code_hash
-                        )
-                        .into(),
-                    ),
-                ));
+                        fork.ethereum_deposit_contract, nil_hash, account_info.code_hash
+                    )
+                    .into(),
+                )));
             }
             tracing::debug!(
                 address = ?fork.ethereum_deposit_contract,
@@ -392,16 +383,14 @@ where
                 "Verified Ethereum deposit contract replaced"
             );
         } else {
-            return Err(BlockExecutionError::Internal(
-                InternalBlockExecutionError::Other(
-                    format!(
-                        "FORK VERIFICATION FAILED: Ethereum deposit contract at {:?} \
+            return Err(BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                format!(
+                    "FORK VERIFICATION FAILED: Ethereum deposit contract at {:?} \
                          does not exist after replacement",
-                        fork.ethereum_deposit_contract
-                    )
-                    .into(),
-                ),
-            ));
+                    fork.ethereum_deposit_contract
+                )
+                .into(),
+            )));
         }
 
         tracing::info!(

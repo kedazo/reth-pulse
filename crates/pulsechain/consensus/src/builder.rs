@@ -27,10 +27,7 @@ where
 {
     type Consensus = Arc<PulseChainBeaconConsensus<<Node::Types as NodeTypes>::ChainSpec>>;
 
-    async fn build_consensus(
-        self,
-        ctx: &BuilderContext<Node>,
-    ) -> eyre::Result<Self::Consensus> {
+    async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
         Ok(Arc::new(PulseChainBeaconConsensus::new(ctx.chain_spec())))
     }
 }

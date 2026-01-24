@@ -35,9 +35,13 @@ pub enum PulseChainHardfork {
 
 impl fmt::Display for PulseChainHardfork {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", match self {
-            Self::PrimordialPulse => "PrimordialPulse",
-        })
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::PrimordialPulse => "PrimordialPulse",
+            }
+        )
     }
 }
 
@@ -99,7 +103,10 @@ pub static PULSECHAIN_MAINNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::ne
         // PrimordialPulse fork at block 17,233,000
         // This is the actual fork point where PulseChain diverges from Ethereum
         // CRITICAL: This must be included for correct fork ID calculation
-        (Box::new(PulseChainHardfork::PrimordialPulse), ForkCondition::Block(PULSECHAIN_PRIMORDIAL_BLOCK)),
+        (
+            Box::new(PulseChainHardfork::PrimordialPulse),
+            ForkCondition::Block(PULSECHAIN_PRIMORDIAL_BLOCK),
+        ),
         // Shanghai: Ethereum's Shanghai timestamp (April 12, 2023)
         // This timestamp was already active when PulseChain forked, so we use Ethereum's time
         // CRITICAL: This must come AFTER PrimordialPulse in the list for correct fork ID

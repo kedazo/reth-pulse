@@ -17,7 +17,6 @@ use alloy_consensus::EMPTY_OMMER_ROOT_HASH;
 use alloy_eips::eip7840::BlobParams;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
-use reth_pulsechain_forks::{ETHEREUM_SHANGHAI_TIME, PULSECHAIN_PRIMORDIAL_BLOCK, PULSECHAIN_SHANGHAI_TIME};
 use reth_consensus_common::validation::{
     validate_4844_header_standalone, validate_against_parent_eip1559_base_fee,
     validate_against_parent_gas_limit, validate_against_parent_hash_number,
@@ -28,6 +27,9 @@ use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{
     Block, BlockHeader, NodePrimitives, RecoveredBlock, SealedBlock, SealedHeader,
+};
+use reth_pulsechain_forks::{
+    ETHEREUM_SHANGHAI_TIME, PULSECHAIN_PRIMORDIAL_BLOCK, PULSECHAIN_SHANGHAI_TIME,
 };
 
 /// PulseChain consensus implementation.
@@ -40,8 +42,8 @@ use reth_primitives_traits::{
 ///
 /// - Blocks with `difficulty > 0`: Validated as PoW blocks (ethash rules)
 /// - Blocks with `difficulty == 0`: Validated as PoS blocks (beacon rules)
-/// - PrimordialPulse block (17,233,000): Has difficulty = 0x20000 (131,072)
-///   and transitions the chain to full PoS
+/// - PrimordialPulse block (17,233,000): Has difficulty = 0x20000 (131,072) and transitions the
+///   chain to full PoS
 #[derive(Debug, Clone)]
 pub struct PulseChainBeaconConsensus<ChainSpec> {
     /// Inner Ethereum beacon consensus engine
@@ -132,7 +134,8 @@ where
         let is_pow_block = !Self::is_pos_header(header_ref);
 
         if is_pow_block {
-            // Block with non-zero difficulty (either pre-merge PoW or PrimordialPulse at 17,233,000)
+            // Block with non-zero difficulty (either pre-merge PoW or PrimordialPulse at
+            // 17,233,000)
             if header_ref.number() == PULSECHAIN_PRIMORDIAL_BLOCK {
                 tracing::debug!(
                     target: "consensus::pulsechain",
@@ -226,7 +229,8 @@ where
         }
 
         // For PrimordialPulse transitions, we need custom validation that doesn't check
-        // difficulty transitions, since the inner validator expects difficulty to stay at 0 post-merge
+        // difficulty transitions, since the inner validator expects difficulty to stay at 0
+        // post-merge
         if is_primordial_pulse || is_after_primordial {
             // Manually validate the critical parent relationships without difficulty checks
             validate_against_parent_hash_number(header.header(), parent)?;

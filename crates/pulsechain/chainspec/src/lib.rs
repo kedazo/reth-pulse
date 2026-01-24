@@ -175,9 +175,7 @@ mod tests {
 
     #[test]
     fn test_pulsechain_fork_id_at_genesis() {
-        use reth_ethereum_forks::Head;
-        use reth_ethereum_forks::ForkCondition;
-        use reth_ethereum_forks::ForkHash;
+        use reth_ethereum_forks::{ForkCondition, ForkHash, Head};
 
         // Print all forks for debugging
         println!("\nPulseChain hardforks list:");
@@ -186,8 +184,10 @@ mod tests {
                 ForkCondition::Block(b) => println!("  {:?} -> Block({})", fork, b),
                 ForkCondition::Timestamp(t) => println!("  {:?} -> Timestamp({})", fork, t),
                 ForkCondition::TTD { activation_block_number, fork_block, total_difficulty } => {
-                    println!("  {:?} -> TTD {{ activation: {}, fork_block: {:?}, ttd: {} }}",
-                        fork, activation_block_number, fork_block, total_difficulty);
+                    println!(
+                        "  {:?} -> TTD {{ activation: {}, fork_block: {:?}, ttd: {} }}",
+                        fork, activation_block_number, fork_block, total_difficulty
+                    );
                 }
                 _ => println!("  {:?} -> {:?}", fork, condition),
             }
@@ -199,7 +199,10 @@ mod tests {
         println!("  Start with genesis hash: {:?}", manual_hash);
 
         // Add each block fork
-        for num in [1150000u64, 1920000, 2463000, 2675000, 4370000, 7280000, 9069000, 9200000, 12244000, 12965000, 13773000, 15050000, 17233000] {
+        for num in [
+            1150000u64, 1920000, 2463000, 2675000, 4370000, 7280000, 9069000, 9200000, 12244000,
+            12965000, 13773000, 15050000, 17233000,
+        ] {
             manual_hash += num;
             println!("  After adding block {}: {:?}", num, manual_hash);
         }
@@ -211,7 +214,10 @@ mod tests {
         // Test WITHOUT block 17233000 (in case peers don't have it)
         println!("\nAlternative calculation WITHOUT block 17233000:");
         let mut alt_hash = ForkHash::from(PULSECHAIN_MAINNET.genesis_hash());
-        for num in [1150000u64, 1920000, 2463000, 2675000, 4370000, 7280000, 9069000, 9200000, 12244000, 12965000, 13773000, 15050000] {
+        for num in [
+            1150000u64, 1920000, 2463000, 2675000, 4370000, 7280000, 9069000, 9200000, 12244000,
+            12965000, 13773000, 15050000,
+        ] {
             alt_hash += num;
         }
         println!("  After block forks (no 17233000): {:?}", alt_hash);
