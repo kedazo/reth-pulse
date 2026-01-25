@@ -14,7 +14,7 @@ use reth_pulsechain::{DepositContractData, SacrificeCredit};
 use revm::{
     bytecode::Bytecode,
     database::{
-        states::{bundle_state::BundleRetention, StorageSlot, StorageWithOriginalValues},
+        states::{StorageSlot, StorageWithOriginalValues},
         State,
     },
     primitives::keccak256,
@@ -173,7 +173,7 @@ where
     let pulse_hash = keccak256(&deposit_data.bytecode);
     let pulse_info = AccountInfo {
         balance: U256::ZERO,
-        nonce: 1,
+        nonce: 0, // NOTE: go-pulse sets nonce=0 for new contract via state modification
         code_hash: pulse_hash,
         code: Some(pulse_code.clone()),
     };
@@ -213,20 +213,24 @@ where
     //    does and why it works!
     state.apply_transition(transitions);
 
-    tracing::info!("Deposit contract transitions applied to transition_state");
-
-    // 4. CRITICAL: Merge transitions into bundle_state to extract bytecode!
-    //
-    // WITHOUT THIS CALL: Bytecode stays in transition_state and is never written to database
-    // WITH THIS CALL: merge_transitions() calls has_new_contract() on each TransitionAccount
-    //                 and extracts bytecode into bundle_state.contracts for database persistence
-    //
-    // This is the missing step that caused Attempts 6-9 to fail!
-    state.merge_transitions(BundleRetention::Reverts);
-
     tracing::info!(
-        "Transitions merged into bundle_state. Bytecode extracted to bundle_state.contracts for database persistence"
+        "Deposit contract transitions applied to transition_state. \
+         Bytecode will be extracted when framework calls merge_transitions() after block execution."
     );
+
+    // NOTE: Do NOT call merge_transitions() here!
+    // The framework calls merge_transitions() AFTER block execution
+    // (engine/tree/src/tree/metrics.rs:131). Calling it here corrupts the revert chain and
+    // causes state root mismatches.
+    //
+    // Attempt #10 called merge_transitions() here which caused:
+    // - State corruption
+    // - State root mismatch at block 17232990 during unwind
+    // - Sync failure
+    //
+    // The transitions we created contain bytecode in TransitionAccount.info.code.
+    // When the framework calls merge_transitions(), has_new_contract() will extract
+    // the bytecode into bundle_state.contracts for database persistence.
 
     Ok(())
 }
