@@ -14,7 +14,7 @@ use reth_pulsechain::{DepositContractData, SacrificeCredit};
 use revm::{
     bytecode::Bytecode,
     database::{
-        states::{StorageSlot, StorageWithOriginalValues},
+        states::{AccountStatus, StorageSlot, StorageWithOriginalValues, TransitionAccount},
         State,
     },
     primitives::keccak256,
@@ -87,7 +87,7 @@ where
 pub(crate) fn replace_deposit_contract<'db, E, DB>(
     evm: &mut E,
     eth_deposit: Address,
-    nil_bytecode: &Bytes,
+    _nil_bytecode: &Bytes,
     pulse_deposit: Address,
     deposit_data: &DepositContractData,
 ) -> Result<(), BlockExecutionError>
@@ -123,57 +123,84 @@ where
     // Collect all transitions to apply
     let mut transitions = Vec::new();
 
-    // 1. Replace Ethereum deposit contract with nil contract Ethereum deposit EXISTS, so use
-    //    change()
+    // 1. Destroy Ethereum deposit contract (SelfDestruct semantics)
+    //
+    //    CRITICAL FIX (Attempt #13): Fully destroy the account, don't set nil code.
+    //    go-pulse does:
+    //      state.SelfDestruct(ethereumDepositContractAddr)  // Marks for deletion
+    //      state.SetCode(ethereumDepositContractAddr, nilContractBytes)  // Sets code...
+    //    BUT go-ethereum's Finalise() deletes any account with selfDestructed==true,
+    //    so the SetCode is effectively a no-op. The account is DELETED entirely.
+    //
+    //    Verified via go-pulse RPC at the latest block:
+    //      eth_getCode("0x00000000219ab540356cbb839cbe05303d7705fa") = "0x" (no code)
+    //      eth_getBalance(...) = "0x0"
+    //      eth_getTransactionCount(...) = "0x0"
+    //
+    //    Previous Attempt #12 used DestroyedChanged with nil contract code (63 bytes),
+    //    which left the account alive with code. This caused EXTCODESIZE > 0, and
+    //    ERC-721 safeTransferFrom calls would try onERC721Received on it, consuming
+    //    extra gas (5833 gas mismatch at block 21,188,649).
+    //
+    //    The correct fix: use Destroyed with info: None to fully delete the account.
     let eth_cache_account = state.load_cache_account(eth_deposit).map_err(|e| {
         BlockExecutionError::Internal(InternalBlockExecutionError::Other(
             format!("Failed to load Ethereum deposit contract: {}", e).into(),
         ))
     })?;
 
-    let nil_code = Bytecode::new_legacy(nil_bytecode.clone());
-    let nil_hash = keccak256(&nil_bytecode);
-    let nil_info = AccountInfo {
-        balance: U256::ZERO,
-        nonce: 0,
-        code_hash: nil_hash,
-        code: Some(nil_code.clone()),
+    // Capture previous info before modifying
+    let eth_previous_info = eth_cache_account.account.as_ref().map(|a| a.info.clone());
+    let eth_previous_status = eth_cache_account.status;
+
+    // Create TransitionAccount with Destroyed status (account fully deleted)
+    // storage_was_destroyed: true ensures all existing storage is wiped from the trie
+    let eth_transition = TransitionAccount {
+        info: None,                              // Account deleted - no info
+        status: AccountStatus::Destroyed,        // Fully destroyed (matches go-pulse SelfDestruct)
+        previous_info: eth_previous_info.clone(),
+        previous_status: eth_previous_status,
+        storage: StorageWithOriginalValues::default(), // No new storage
+        storage_was_destroyed: true,             // CRITICAL: Clears all existing storage from trie
     };
 
-    // Empty storage for selfdestruct
-    let eth_storage = StorageWithOriginalValues::default();
+    // Update the cache account to reflect destruction
+    eth_cache_account.account = None;
+    eth_cache_account.status = AccountStatus::Destroyed;
 
-    let eth_transition = eth_cache_account.change(nil_info, eth_storage);
-
-    tracing::debug!(
+    tracing::info!(
         address = ?eth_deposit,
-        eth_transition_info = ?eth_transition.info,
-        eth_transition_previous_info = ?eth_transition.previous_info,
-        eth_transition_status = ?eth_transition.status,
-        "Prepared transition to replace Ethereum deposit contract with nil contract"
+        previous_status = ?eth_previous_status,
+        new_status = ?eth_transition.status,
+        storage_was_destroyed = eth_transition.storage_was_destroyed,
+        "Prepared transition to DESTROY Ethereum deposit contract (account + storage fully deleted)"
     );
 
     transitions.push((eth_deposit, eth_transition));
 
-    // 2. Deploy PulseChain deposit contract with code and storage CRITICAL: Use change() not
-    //    newly_created()!
+    // 2. Deploy PulseChain deposit contract with code and storage
     //
-    //    increment_balance() (which works) uses account_info_change() internally,
-    //    which calls on_changed() not on_created(). The status matters for persistence!
-    //
-    //    Hypothesis: change() + Changed status persists code field correctly,
-    //                newly_created() + InMemoryChange status loses code field
+    //    The PulseChain deposit contract (0x369...369) likely doesn't exist before the fork,
+    //    so this is creating a new contract. go-pulse does:
+    //      - Check balance, burn if non-zero
+    //      - SetCode(pulseDepositContractAddr, depositContractBytes)
+    //      - SetNonce(pulseDepositContractAddr, 0)
+    //      - SetState() for each storage slot (0x22-0x40)
     let pulse_cache_account = state.load_cache_account(pulse_deposit).map_err(|e| {
         BlockExecutionError::Internal(InternalBlockExecutionError::Other(
             format!("Failed to load cache for PulseChain deposit contract: {}", e).into(),
         ))
     })?;
 
+    // Capture previous info
+    let pulse_previous_info = pulse_cache_account.account.as_ref().map(|a| a.info.clone());
+    let pulse_previous_status = pulse_cache_account.status;
+
     let pulse_code = Bytecode::new_legacy(deposit_data.bytecode.clone());
     let pulse_hash = keccak256(&deposit_data.bytecode);
     let pulse_info = AccountInfo {
         balance: U256::ZERO,
-        nonce: 0, // NOTE: go-pulse sets nonce=0 for new contract via state modification
+        nonce: 0, // go-pulse sets nonce=0 for new contract
         code_hash: pulse_hash,
         code: Some(pulse_code.clone()),
     };
@@ -194,15 +221,41 @@ where
         })
         .collect();
 
-    // Use change() instead of newly_created() - matches increment_balance pattern
-    let pulse_transition = pulse_cache_account.change(pulse_info, pulse_storage);
+    // Determine the appropriate status based on whether the account exists
+    let (new_status, storage_destroyed) = if pulse_previous_info.is_none() {
+        // Account doesn't exist - creating new (InMemoryChange status, no storage to destroy)
+        (AccountStatus::InMemoryChange, false)
+    } else {
+        // Account exists - use DestroyedChanged to clear any existing storage then set new
+        (AccountStatus::DestroyedChanged, true)
+    };
+
+    // Create TransitionAccount manually
+    let pulse_transition = TransitionAccount {
+        info: Some(pulse_info.clone()),
+        status: new_status,
+        previous_info: pulse_previous_info,
+        previous_status: pulse_previous_status,
+        storage: pulse_storage.clone(),
+        storage_was_destroyed: storage_destroyed,
+    };
+
+    // Update cache account
+    let plain_storage = pulse_storage
+        .iter()
+        .map(|(k, v)| (*k, v.present_value))
+        .collect();
+    pulse_cache_account.account = Some(revm::database::states::PlainAccount {
+        info: pulse_info,
+        storage: plain_storage,
+    });
+    pulse_cache_account.status = new_status;
 
     tracing::info!(
         address = ?pulse_deposit,
-        pulse_transition_info_code_hash = ?pulse_transition.info.as_ref().map(|i| i.code_hash),
-        pulse_transition_info_has_code = pulse_transition.info.as_ref().and_then(|i| i.code.as_ref()).is_some(),
-        pulse_transition_previous_info = ?pulse_transition.previous_info,
-        pulse_transition_status = ?pulse_transition.status,
+        previous_status = ?pulse_previous_status,
+        new_status = ?pulse_transition.status,
+        storage_was_destroyed = pulse_transition.storage_was_destroyed,
         storage_slots = deposit_data.storage.len(),
         "Prepared transition to create PulseChain deposit contract with initialized storage"
     );

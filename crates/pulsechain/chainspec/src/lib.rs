@@ -143,9 +143,13 @@ mod tests {
             .fork(EthereumHardfork::Paris)
             .active_at_block(PULSECHAIN_PRIMORDIAL_BLOCK));
 
-        // Verify Shanghai is active after Ethereum's timestamp
-        // (PulseChain forked after Shanghai was already active)
+        // Shanghai uses PulseChain's timestamp (1683786515), not Ethereum's (1681338455).
+        // Pre-fork blocks needing Ethereum Shanghai rules are handled by executor overrides.
         assert!(spec
+            .hardforks
+            .fork(EthereumHardfork::Shanghai)
+            .active_at_timestamp(PULSECHAIN_SHANGHAI_TIME));
+        assert!(!spec
             .hardforks
             .fork(EthereumHardfork::Shanghai)
             .active_at_timestamp(ETHEREUM_SHANGHAI_TIME));

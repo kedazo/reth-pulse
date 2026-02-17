@@ -107,10 +107,13 @@ pub static PULSECHAIN_MAINNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::ne
             Box::new(PulseChainHardfork::PrimordialPulse),
             ForkCondition::Block(PULSECHAIN_PRIMORDIAL_BLOCK),
         ),
-        // Shanghai: Ethereum's Shanghai timestamp (April 12, 2023)
-        // This timestamp was already active when PulseChain forked, so we use Ethereum's time
+        // Shanghai: PulseChain's Shanghai timestamp (May 11, 2023)
+        // Note: PulseChain uses its own Shanghai timestamp, not Ethereum's
         // CRITICAL: This must come AFTER PrimordialPulse in the list for correct fork ID
-        (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(ETHEREUM_SHANGHAI_TIME)),
+        (EthereumHardfork::Shanghai.boxed(), ForkCondition::Timestamp(PULSECHAIN_SHANGHAI_TIME)),
+        // NOTE: PulseChain has NOT activated Cancun or Prague as of the go-pulse config.
+        // go-pulse/params/pulse.go only defines up to ShanghaiTime for PulseChainConfig.
+        // Do NOT add Cancun/Prague until PulseChain officially activates them.
     ])
 });
 
@@ -149,15 +152,20 @@ pub const PULSECHAIN_TTD: U256 = U256::from_limbs([
 ]);
 
 /// Shanghai activation timestamp (inherited from Ethereum mainnet)
-/// April 12, 2023, 22:27:35 UTC
-/// This is Ethereum's Shanghai timestamp, which PulseChain inherited since the fork
-/// occurred after Shanghai was already active on Ethereum
+/// Ethereum's Shanghai timestamp (April 12, 2023, 22:27:35 UTC)
+/// Kept for reference - this is when Ethereum activated Shanghai
 pub const ETHEREUM_SHANGHAI_TIME: u64 = 1681338455;
 
-/// PulseChain-specific Shanghai timestamp (unused - kept for reference)
+/// PulseChain Shanghai activation timestamp
 /// May 11, 2023, 06:01:55 UTC
-/// Note: Not used because PulseChain forked from Ethereum AFTER Shanghai was already active
+/// From go-pulse/params/pulse.go: ShanghaiTime: newUint64(1683786515)
 pub const PULSECHAIN_SHANGHAI_TIME: u64 = 1683786515;
+
+// NOTE: Cancun and Prague are NOT yet activated on PulseChain mainnet.
+// The go-pulse PulseChainConfig only defines up to ShanghaiTime.
+// Do NOT add these until PulseChain officially activates them:
+// pub const PULSECHAIN_CANCUN_TIME: u64 = ...;
+// pub const PULSECHAIN_PRAGUE_TIME: u64 = ...;
 
 /// Helper function to determine if a block number is before the PrimordialPulse fork
 #[inline]
@@ -235,8 +243,14 @@ mod tests {
         assert!(hardforks.fork(EthereumHardfork::Paris).active_at_block(15_537_394));
         // Block 15,537,393 (last PoW block) should NOT use Paris rules
         assert!(!hardforks.fork(EthereumHardfork::Paris).active_at_block(15_537_393));
-        // Shanghai uses Ethereum's timestamp since PulseChain forked after Shanghai
+        // Shanghai uses PulseChain's timestamp (1683786515), not Ethereum's (1681338455).
+        // Pre-fork blocks that need Ethereum's Shanghai rules are handled by the executor
+        // overrides (evm_env SpecId, finish() withdrawals, read_block_bodies).
         assert!(hardforks
+            .fork(EthereumHardfork::Shanghai)
+            .active_at_timestamp(PULSECHAIN_SHANGHAI_TIME));
+        // Confirm it's NOT active at Ethereum's Shanghai time
+        assert!(!hardforks
             .fork(EthereumHardfork::Shanghai)
             .active_at_timestamp(ETHEREUM_SHANGHAI_TIME));
     }

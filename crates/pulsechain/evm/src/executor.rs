@@ -35,9 +35,13 @@ use reth_ethereum::{
     rpc::types::engine::ExecutionData,
     Block, EthPrimitives, Receipt, TransactionSigned,
 };
+use reth_ethereum::chainspec::EthereumHardforks;
 use reth_pulsechain::get_primordial_pulse_fork;
-use reth_pulsechain_forks::{get_effective_chain_id, PULSECHAIN_PRIMORDIAL_BLOCK};
-use revm::Database as RevmDatabase;
+use reth_pulsechain_forks::{
+    get_effective_chain_id, is_before_primordial_pulse, ETHEREUM_SHANGHAI_TIME,
+    PULSECHAIN_PRIMORDIAL_BLOCK,
+};
+use revm::{context::Block as RevmBlock, Database as RevmDatabase};
 
 use crate::fork_state::{apply_sacrifice_credits, replace_deposit_contract};
 
@@ -124,6 +128,29 @@ impl ConfigureEvm for PulseChainEvmConfig {
         let effective_chain_id = get_effective_chain_id(header.number);
         env.cfg_env.chain_id = effective_chain_id;
 
+        // CRITICAL: For pre-fork blocks, use Ethereum's Shanghai timestamp.
+        //
+        // go-pulse patch 0028 ("Allow for increased Shanghai time with PulseChain"):
+        //   func (c *ChainConfig) IsShanghai(num *big.Int, time uint64) bool {
+        //       if c.PrimordialPulseAhead(num) {
+        //           return 1681338455 <= time  // Ethereum mainnet Shanghai
+        //       }
+        //       return isTimestampForked(c.ShanghaiTime, time)  // PulseChain Shanghai
+        //   }
+        //
+        // Before the PulseChain fork (block 17,233,000), these are Ethereum mainnet
+        // blocks that must follow Ethereum's hardfork schedule. Ethereum activated
+        // Shanghai at timestamp 1681338455 (April 12, 2023), but PulseChain's Shanghai
+        // is at timestamp 1683786515 (May 11, 2023). Without this override, blocks
+        // between these timestamps would incorrectly run with Paris (pre-Shanghai)
+        // rules, causing gas mismatches from missing EIP-3651/3855/3860.
+        if is_before_primordial_pulse(header.number)
+            && header.timestamp >= ETHEREUM_SHANGHAI_TIME
+            && env.cfg_env.spec < SpecId::SHANGHAI
+        {
+            env.cfg_env.spec = SpecId::SHANGHAI;
+        }
+
         Ok(env)
     }
 
@@ -138,6 +165,14 @@ impl ConfigureEvm for PulseChainEvmConfig {
         let next_block_number = parent.number + 1;
         let effective_chain_id = get_effective_chain_id(next_block_number);
         env.cfg_env.chain_id = effective_chain_id;
+
+        // For pre-fork blocks, use Ethereum's Shanghai timestamp (see evm_env() comment)
+        if is_before_primordial_pulse(next_block_number)
+            && attributes.timestamp >= ETHEREUM_SHANGHAI_TIME
+            && env.cfg_env.spec < SpecId::SHANGHAI
+        {
+            env.cfg_env.spec = SpecId::SHANGHAI;
+        }
 
         Ok(env)
     }
@@ -268,7 +303,7 @@ where
             })?;
 
         if let Some(account_info) = pulse_deposit_account {
-            if account_info.code.is_none() || account_info.code_hash.is_zero() {
+            if account_info.code_hash.is_zero() || account_info.code_hash == revm::primitives::KECCAK_EMPTY {
                 return Err(BlockExecutionError::Internal(InternalBlockExecutionError::Other(
                     format!(
                         "FORK VERIFICATION FAILED: PulseChain deposit contract at {:?} \
@@ -352,7 +387,10 @@ where
             "Verified PulseChain deposit contract storage initialized"
         );
 
-        // Verify Ethereum deposit contract was replaced with nil contract
+        // Verify Ethereum deposit contract was destroyed
+        //
+        // In go-pulse, SelfDestruct marks the account for deletion, and Finalise() deletes it.
+        // The account should NOT exist after the fork (or exist as empty if PLS was sent to it).
         let eth_deposit_account =
             self.inner.evm_mut().db_mut().basic(fork.ethereum_deposit_contract).map_err(|e| {
                 BlockExecutionError::Internal(InternalBlockExecutionError::Other(
@@ -364,33 +402,41 @@ where
                 ))
             })?;
 
-        if let Some(account_info) = eth_deposit_account {
-            // Verify it has the nil contract code hash
-            let nil_hash = revm::primitives::keccak256(&fork.nil_contract_bytecode);
-            if account_info.code_hash != nil_hash {
-                return Err(BlockExecutionError::Internal(InternalBlockExecutionError::Other(
-                    format!(
-                        "FORK VERIFICATION FAILED: Ethereum deposit contract at {:?} \
-                             was not replaced with nil contract. Expected code hash {:?}, got {:?}",
-                        fork.ethereum_deposit_contract, nil_hash, account_info.code_hash
-                    )
-                    .into(),
-                )));
+        match eth_deposit_account {
+            None => {
+                // Account correctly destroyed - expected after SelfDestruct + Finalise
+                tracing::debug!(
+                    address = ?fork.ethereum_deposit_contract,
+                    "Verified Ethereum deposit contract destroyed (account does not exist)"
+                );
             }
-            tracing::debug!(
-                address = ?fork.ethereum_deposit_contract,
-                code_hash = ?account_info.code_hash,
-                "Verified Ethereum deposit contract replaced"
-            );
-        } else {
-            return Err(BlockExecutionError::Internal(InternalBlockExecutionError::Other(
-                format!(
-                    "FORK VERIFICATION FAILED: Ethereum deposit contract at {:?} \
-                         does not exist after replacement",
-                    fork.ethereum_deposit_contract
-                )
-                .into(),
-            )));
+            Some(account_info) => {
+                // Account exists - acceptable only if it's empty (someone sent PLS to it later)
+                // or if it still has the nil contract code (intermediate state during fork block)
+                let has_code = !account_info.code_hash.is_zero()
+                    && account_info.code_hash != revm::primitives::KECCAK_EMPTY;
+
+                if has_code {
+                    // Only acceptable if it's the nil contract (intermediate state during fork block)
+                    let nil_hash = revm::primitives::keccak256(&fork.nil_contract_bytecode);
+                    if account_info.code_hash != nil_hash {
+                        return Err(BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                            format!(
+                                "FORK VERIFICATION FAILED: Ethereum deposit contract at {:?} \
+                                     still has unexpected code. Expected destroyed or nil contract, got code_hash {:?}",
+                                fork.ethereum_deposit_contract, account_info.code_hash
+                            )
+                            .into(),
+                        )));
+                    }
+                }
+                tracing::debug!(
+                    address = ?fork.ethereum_deposit_contract,
+                    code_hash = ?account_info.code_hash,
+                    balance = %account_info.balance,
+                    "Ethereum deposit contract exists (empty or nil contract)"
+                );
+            }
         }
 
         tracing::info!(
@@ -473,7 +519,36 @@ where
             );
         }
 
-        self.inner.apply_pre_execution_changes()
+        // PulseChain-specific pre-execution changes:
+        // We replicate EthBlockExecutor::apply_pre_execution_changes but handle beacon root
+        // as OPTIONAL since PulseChain doesn't have a beacon chain.
+        //
+        // Standard Ethereum requires parent_beacon_block_root for all Cancun+ blocks,
+        // but PulseChain blocks have this field as None (no beacon chain infrastructure).
+        // Go-pulse handles this by only calling ProcessBeaconBlockRoot if the root is present.
+
+        // 1. Set state clear flag if the block is after the Spurious Dragon hardfork
+        let state_clear_flag = self
+            .inner
+            .spec
+            .is_spurious_dragon_active_at_block(self.inner.evm.block().number().saturating_to());
+        self.inner.evm.db_mut().set_state_clear_flag(state_clear_flag);
+
+        // 2. Apply EIP-2935 blockhashes contract call (always)
+        self.inner
+            .system_caller
+            .apply_blockhashes_contract_call(self.inner.ctx.parent_hash, &mut self.inner.evm)?;
+
+        // 3. Apply EIP-4788 beacon root contract call ONLY if beacon root is present
+        // This is the key PulseChain difference: beacon root is optional
+        if let Some(beacon_root) = self.inner.ctx.parent_beacon_block_root {
+            self.inner
+                .system_caller
+                .apply_beacon_root_contract_call(Some(beacon_root), &mut self.inner.evm)?;
+        }
+        // If beacon root is None, we simply skip the call (matching go-pulse behavior)
+
+        Ok(())
     }
 
     fn execute_transaction_without_commit(
@@ -492,7 +567,116 @@ where
     }
 
     fn finish(self) -> Result<(E, BlockExecutionResult<Receipt>), BlockExecutionError> {
-        self.inner.finish()
+        let block_number = self.block_number;
+        let block_timestamp: u64 = self.inner.evm.block().timestamp().saturating_to();
+
+        // CRITICAL: PrimordialPulse block (17,233,000) is treated as a PoW block by go-pulse.
+        //
+        // go-pulse sets difficulty=131072 for this block (patch 0007), causing
+        // beacon.Finalize() to see IsPoSHeader()=false and delegate to ethash.Finalize().
+        // ethash.Finalize() does two things:
+        //   1. Applies fork modifications (sacrifice credits + deposit contract)
+        //   2. Calls accumulateRewards() → gives 2 ETH block reward to beneficiary
+        // And because it takes the ethash (not beacon) path, withdrawals are NOT processed.
+        //
+        // In reth, Paris is active at block 15,537,394, so base_block_reward() returns None
+        // for block 17,233,000 (no block reward). We must manually add the 2 ETH reward
+        // and skip withdrawals to match go-pulse behavior.
+        if block_number == PULSECHAIN_PRIMORDIAL_BLOCK {
+            let beneficiary = self.inner.evm.block().beneficiary();
+
+            // Check withdrawal situation before consuming self.inner
+            let shanghai_active =
+                self.inner.spec.is_shanghai_active_at_timestamp(block_timestamp);
+            let has_withdrawals = self
+                .inner
+                .ctx
+                .withdrawals
+                .as_deref()
+                .map_or(false, |w| !w.is_empty());
+
+            if has_withdrawals && shanghai_active {
+                tracing::warn!(
+                    block = block_number,
+                    "PrimordialPulse block has withdrawals and Shanghai is active. \
+                     go-pulse skips withdrawals for this block (ethash path). \
+                     inner.finish() may incorrectly process them."
+                );
+            }
+
+            // Let inner.finish() run (it will compute no block reward since Paris is
+            // active, and may process withdrawals depending on Shanghai activation)
+            let (mut evm, result) = self.inner.finish()?;
+
+            // Add the 2 ETH PoW block reward (Constantinople+ reward)
+            // go-pulse's accumulateRewards gives this because the block is treated as PoW
+            // (difficulty=131072, patch 0007)
+            const ETH_TO_WEI: u128 = 1_000_000_000_000_000_000;
+            const BLOCK_REWARD: u128 = 2 * ETH_TO_WEI;
+
+            tracing::info!(
+                block = block_number,
+                beneficiary = ?beneficiary,
+                reward = BLOCK_REWARD,
+                "Applying PoW block reward for PrimordialPulse block (go-pulse treats as PoW)"
+            );
+
+            evm.db_mut()
+                .increment_balances(alloc::vec![(beneficiary, BLOCK_REWARD)])
+                .map_err(|_| {
+                    BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                        "Failed to apply PrimordialPulse PoW block reward".into(),
+                    ))
+                })?;
+
+            Ok((evm, result))
+        }
+        // For pre-fork blocks, the chain spec uses PulseChain's Shanghai timestamp
+        // (1683786515), but these are Ethereum mainnet blocks that should use Ethereum's
+        // Shanghai timestamp (1681338455). The inner finish() calls
+        // post_block_balance_increments() which checks the chain spec to decide whether
+        // to process withdrawals. It will skip them because the chain spec says Shanghai
+        // isn't active yet. We must manually apply them afterward.
+        //
+        // go-pulse patch 0028: pre-fork blocks use Ethereum's Shanghai time (1681338455),
+        // post-fork blocks use PulseChain's Shanghai time (1683786515).
+        else if is_before_primordial_pulse(block_number)
+            && block_timestamp >= ETHEREUM_SHANGHAI_TIME
+            && !self.inner.spec.is_shanghai_active_at_timestamp(block_timestamp)
+        {
+            // Collect withdrawal balance increments before self.inner is consumed
+            let withdrawal_increments: Vec<_> = self
+                .inner
+                .ctx
+                .withdrawals
+                .as_ref()
+                .map(|ws| {
+                    ws.iter()
+                        .filter(|w| w.amount > 0)
+                        .map(|w| (w.address, w.amount_wei().to::<u128>()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // inner.finish() handles block rewards, DAO fork, etc. but skips withdrawals
+            let (mut evm, result) = self.inner.finish()?;
+
+            // Manually apply the missing withdrawal balance increments
+            if !withdrawal_increments.is_empty() {
+                evm.db_mut()
+                    .increment_balances(withdrawal_increments)
+                    .map_err(|_| {
+                        BlockExecutionError::Internal(InternalBlockExecutionError::Other(
+                            "Failed to apply pre-fork Shanghai withdrawal balance increments"
+                                .into(),
+                        ))
+                    })?;
+            }
+
+            Ok((evm, result))
+        } else {
+            self.inner.finish()
+        }
     }
 
     fn set_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) {
