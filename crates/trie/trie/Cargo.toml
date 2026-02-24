@@ -14,7 +14,7 @@ workspace = true
 [dependencies]
 # reth
 reth-execution-errors.workspace = true
-reth-primitives-traits.workspace = true
+reth-primitives-traits = { workspace = true, features = ["std"] }
 reth-stages-types.workspace = true
 reth-storage-errors.workspace = true
 reth-trie-sparse.workspace = true
@@ -95,6 +95,13 @@ test-utils = [
     "reth-ethereum-primitives/test-utils",
     "reth-trie-sparse/test-utils",
     "reth-stages-types/test-utils",
+]
+serde-bincode-compat = [
+    "alloy-consensus/serde-bincode-compat",
+    "alloy-eips/serde-bincode-compat",
+    "reth-ethereum-primitives/serde-bincode-compat",
+    "reth-primitives-traits/serde-bincode-compat",
+    "reth-trie-common/serde-bincode-compat",
 ]
 
 [[bench]]

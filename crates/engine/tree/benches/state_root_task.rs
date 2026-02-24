@@ -12,8 +12,8 @@ use rand::Rng;
 use reth_chainspec::ChainSpec;
 use reth_db_common::init::init_genesis;
 use reth_engine_tree::tree::{
-    executor::WorkloadExecutor, precompile_cache::PrecompileCacheMap, PayloadProcessor,
-    StateProviderBuilder, TreeConfig,
+    precompile_cache::PrecompileCacheMap, ExecutionEnv, PayloadProcessor, StateProviderBuilder,
+    TreeConfig,
 };
 use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::OnStateHook;
@@ -62,6 +62,7 @@ fn create_bench_state_updates(params: &BenchParams) -> Vec<EvmState> {
                     storage: HashMap::default(),
                     status: AccountStatus::SelfDestructed,
                     transaction_id: 0,
+                    original_info: Box::new(AccountInfo::default()),
                 }
             } else {
                 RevmAccount {
@@ -70,6 +71,7 @@ fn create_bench_state_updates(params: &BenchParams) -> Vec<EvmState> {
                         nonce: rng.random::<u64>(),
                         code_hash: KECCAK_EMPTY,
                         code: Some(Default::default()),
+                        account_id: None,
                     },
                     storage: (0..rng.random_range(0..=params.storage_slots_per_account))
                         .map(|_| {
@@ -84,6 +86,7 @@ fn create_bench_state_updates(params: &BenchParams) -> Vec<EvmState> {
                         })
                         .collect(),
                     status: AccountStatus::Touched,
+                    original_info: Box::new(AccountInfo::default()),
                     transaction_id: 0,
                 }
             };
@@ -216,7 +219,7 @@ fn bench_state_root(c: &mut Criterion) {
                         setup_provider(&factory, &state_updates).expect("failed to setup provider");
 
                         let payload_processor = PayloadProcessor::new(
-                            WorkloadExecutor::default(),
+                            reth_tasks::Runtime::test(),
                             EthEvmConfig::new(factory.chain_spec()),
                             &TreeConfig::default(),
                             PrecompileCacheMap::default(),
@@ -228,7 +231,7 @@ fn bench_state_root(c: &mut Criterion) {
                     |(genesis_hash, mut payload_processor, provider, state_updates)| {
                         black_box({
                             let mut handle = payload_processor.spawn(
-                                Default::default(),
+                                ExecutionEnv::test_default(),
                                 (
                                     Vec::<
                                         Result<
@@ -239,7 +242,10 @@ fn bench_state_root(c: &mut Criterion) {
                                     std::convert::identity,
                                 ),
                                 StateProviderBuilder::new(provider.clone(), genesis_hash, None),
-                                OverlayStateProviderFactory::new(provider),
+                                OverlayStateProviderFactory::new(
+                                    provider,
+                                    reth_trie_db::ChangesetCache::new(),
+                                ),
                                 &TreeConfig::default(),
                                 None,
                             );

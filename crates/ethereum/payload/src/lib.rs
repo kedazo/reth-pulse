@@ -155,7 +155,7 @@ where
     let state_provider = client.state_by_block_hash(parent_header.hash())?;
     let state = StateProviderDatabase::new(state_provider.as_ref());
     let mut db =
-        State::builder().with_database_ref(cached_reads.as_db(state)).with_bundle_update().build();
+        State::builder().with_database(cached_reads.as_db_mut(state)).with_bundle_update().build();
 
     let mut builder = evm_config
         .builder_for_next_block(
@@ -247,14 +247,14 @@ where
                     limit: MAX_RLP_BLOCK_SIZE,
                 },
             );
-            continue;
+            continue
         }
 
         // There's only limited amount of blob space available per block, so we need to check if
         // the EIP-4844 can still fit in the block
         let mut blob_tx_sidecar = None;
-        if let Some(blob_tx) = tx.as_eip4844() {
-            let tx_blob_count = blob_tx.tx().blob_versioned_hashes.len() as u64;
+        if let Some(blob_hashes) = tx.blob_versioned_hashes() {
+            let tx_blob_count = blob_hashes.len() as u64;
 
             if block_blob_count + tx_blob_count > max_blob_count {
                 // we can't fit this _blob_ transaction into the block, so we mark it as
@@ -329,8 +329,8 @@ where
         };
 
         // add to the total blob gas used if the transaction successfully executed
-        if let Some(blob_tx) = tx.as_eip4844() {
-            block_blob_count += blob_tx.tx().blob_versioned_hashes.len() as u64;
+        if let Some(blob_hashes) = tx.blob_versioned_hashes() {
+            block_blob_count += blob_hashes.len() as u64;
 
             // if we've reached the max blob count, we can skip blob txs entirely
             if block_blob_count == max_blob_count {

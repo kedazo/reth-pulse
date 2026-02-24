@@ -15,7 +15,7 @@ use revm::{
     bytecode::Bytecode,
     database::{
         states::{AccountStatus, StorageSlot, StorageWithOriginalValues, TransitionAccount},
-        State,
+        DatabaseCommitExt, State,
     },
     primitives::keccak256,
     Database,
@@ -118,8 +118,6 @@ where
     // 3. Collect transitions in a Vec
     // 4. Apply transitions via state.apply_transition() ← THIS WAS MISSING!
 
-    use revm::state::AccountInfo;
-
     // Collect all transitions to apply
     let mut transitions = Vec::new();
 
@@ -198,11 +196,12 @@ where
 
     let pulse_code = Bytecode::new_legacy(deposit_data.bytecode.clone());
     let pulse_hash = keccak256(&deposit_data.bytecode);
-    let pulse_info = AccountInfo {
+    let pulse_info = revm::state::AccountInfo {
         balance: U256::ZERO,
         nonce: 0, // go-pulse sets nonce=0 for new contract
         code_hash: pulse_hash,
         code: Some(pulse_code.clone()),
+        account_id: None,
     };
 
     // Convert storage to StorageWithOriginalValues format

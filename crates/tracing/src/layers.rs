@@ -1,4 +1,6 @@
 use crate::{formatter::LogFormat, LayerInfo};
+#[cfg(feature = "otlp-logs")]
+use reth_tracing_otlp::{log_layer, OtlpLogsConfig};
 #[cfg(feature = "otlp")]
 use reth_tracing_otlp::{span_layer, OtlpConfig};
 use rolling_file::{RollingConditionBasic, RollingFileAppender};
@@ -123,7 +125,7 @@ impl Layers {
         filter: &str,
         file_info: FileInfo,
     ) -> eyre::Result<FileWorkerGuard> {
-        let (writer, guard) = file_info.create_log_writer();
+        let (writer, guard) = file_info.create_log_writer()?;
         let file_filter = build_env_filter(None, filter)?;
         let layer = format.apply(file_filter, None, Some(writer));
         self.add_layer(layer);
@@ -142,6 +144,42 @@ impl Layers {
         Ok(())
     }
 
+    #[cfg(feature = "tracy")]
+    pub(crate) fn tracy(&mut self, config: LayerInfo) -> eyre::Result<()> {
+        // Newtype wrapper around `DefaultFields` so that `FormattedFields<TracyFields>` uses a
+        // distinct extension key from the fmt layer's `FormattedFields<DefaultFields>`. Without
+        // this, when both layers are active the fmt layer may insert ANSI-colored fields first,
+        // and the Tracy layer reuses them — leaking escape codes into Tracy zone text.
+        struct TracyFields(tracing_subscriber::fmt::format::DefaultFields);
+        impl<'writer> tracing_subscriber::fmt::FormatFields<'writer> for TracyFields {
+            fn format_fields<R: tracing_subscriber::field::RecordFields>(
+                &self,
+                writer: tracing_subscriber::fmt::format::Writer<'writer>,
+                fields: R,
+            ) -> core::fmt::Result {
+                self.0.format_fields(writer, fields)
+            }
+        }
+
+        struct Config(TracyFields);
+        impl tracing_tracy::Config for Config {
+            type Formatter = TracyFields;
+            fn formatter(&self) -> &Self::Formatter {
+                &self.0
+            }
+            fn format_fields_in_zone_name(&self) -> bool {
+                false
+            }
+        }
+
+        self.add_layer(
+            tracing_tracy::TracyLayer::new(Config(TracyFields(Default::default()))).with_filter(
+                build_env_filter(Some(config.default_directive.parse()?), &config.filters)?,
+            ),
+        );
+        Ok(())
+    }
+
     /// Add OTLP spans layer to the layer collection
     #[cfg(feature = "otlp")]
     pub fn with_span_layer(
@@ -156,6 +194,22 @@ impl Layers {
             .with_filter(filter);
 
         self.add_layer(span_layer);
+
+        Ok(())
+    }
+
+    /// Add OTLP logs layer to the layer collection
+    #[cfg(feature = "otlp-logs")]
+    pub fn with_log_layer(
+        &mut self,
+        otlp_config: OtlpLogsConfig,
+        filter: EnvFilter,
+    ) -> eyre::Result<()> {
+        let log_layer = log_layer(otlp_config)
+            .map_err(|e| eyre::eyre!("Failed to build OTLP log exporter {}", e))?
+            .with_filter(filter);
+
+        self.add_layer(log_layer);
 
         Ok(())
     }
@@ -184,32 +238,29 @@ impl FileInfo {
     }
 
     /// Creates the log directory if it doesn't exist.
-    ///
-    /// # Returns
-    /// A reference to the path of the log directory.
-    fn create_log_dir(&self) -> &Path {
+    fn create_log_dir(&self) -> eyre::Result<&Path> {
         let log_dir: &Path = self.dir.as_ref();
         if !log_dir.exists() {
-            std::fs::create_dir_all(log_dir).expect("Could not create log directory");
+            std::fs::create_dir_all(log_dir)
+                .map_err(|err| eyre::eyre!("Could not create log directory {log_dir:?}: {err}"))?;
         }
-        log_dir
+        Ok(log_dir)
     }
 
     /// Creates a non-blocking writer for the log file.
-    ///
-    /// # Returns
-    /// A tuple containing the non-blocking writer and its associated worker guard.
-    fn create_log_writer(&self) -> (tracing_appender::non_blocking::NonBlocking, WorkerGuard) {
-        let log_dir = self.create_log_dir();
+    fn create_log_writer(
+        &self,
+    ) -> eyre::Result<(tracing_appender::non_blocking::NonBlocking, WorkerGuard)> {
+        let log_dir = self.create_log_dir()?;
         let (writer, guard) = tracing_appender::non_blocking(
             RollingFileAppender::new(
                 log_dir.join(&self.file_name),
                 RollingConditionBasic::new().max_size(self.max_size_bytes),
                 self.max_files,
             )
-            .expect("Could not initialize file logging"),
+            .map_err(|err| eyre::eyre!("Could not initialize file logging: {err}"))?,
         );
-        (writer, guard)
+        Ok((writer, guard))
     }
 }
 

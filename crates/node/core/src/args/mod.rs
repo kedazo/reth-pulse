@@ -26,7 +26,7 @@ pub use log::{ColorMode, LogArgs, Verbosity};
 
 /// `TraceArgs` for tracing and spans support
 mod trace;
-pub use trace::{OtlpInitStatus, TraceArgs};
+pub use trace::{OtlpInitStatus, OtlpLogsStatus, TraceArgs};
 
 /// `MetricArgs` to configure metrics.
 mod metric;
@@ -54,7 +54,7 @@ pub use dev::DevArgs;
 
 /// PruneArgs for configuring the pruning and full node
 mod pruning;
-pub use pruning::PruningArgs;
+pub use pruning::{DefaultPruningValues, PruningArgs};
 
 /// DatadirArgs for configuring data storage paths
 mod datadir_args;
@@ -68,17 +68,17 @@ pub use benchmark_args::BenchmarkArgs;
 mod engine;
 pub use engine::{DefaultEngineValues, EngineArgs};
 
-/// `RessArgs` for configuring ress subprotocol.
-mod ress_args;
-pub use ress_args::RessArgs;
-
 /// `EraArgs` for configuring ERA files import.
 mod era;
 pub use era::{DefaultEraHost, EraArgs, EraSourceArgs};
 
 /// `StaticFilesArgs` for configuring static files.
 mod static_files;
-pub use static_files::StaticFilesArgs;
+pub use static_files::{StaticFilesArgs, MINIMAL_BLOCKS_PER_FILE};
+
+/// `StorageArgs` for configuring storage settings.
+mod storage;
+pub use storage::StorageArgs;
 
 mod error;
 pub mod types;

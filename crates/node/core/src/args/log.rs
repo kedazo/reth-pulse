@@ -8,8 +8,11 @@ use reth_tracing::{
 };
 use std::{fmt, fmt::Display};
 use tracing::{level_filters::LevelFilter, Level};
+
 /// Constant to convert megabytes to bytes
 const MB_TO_BYTES: u64 = 1024 * 1024;
+
+const PROFILER_TRACING_FILTER: &str = "debug";
 
 /// The log configuration.
 #[derive(Debug, Args)]
@@ -45,8 +48,10 @@ pub struct LogArgs {
 
     /// The maximum amount of log files that will be stored. If set to 0, background file logging
     /// is disabled.
-    #[arg(long = "log.file.max-files", value_name = "COUNT", global = true, default_value_t = 5)]
-    pub log_file_max_files: usize,
+    ///
+    /// Default: 5 for `node` command, 0 for non-node utility subcommands.
+    #[arg(long = "log.file.max-files", value_name = "COUNT", global = true)]
+    pub log_file_max_files: Option<usize>,
 
     /// Write logs to journald.
     #[arg(long = "log.journald", global = true)]
@@ -70,10 +75,24 @@ pub struct LogArgs {
         long = "log.samply.filter",
         value_name = "FILTER",
         global = true,
-        default_value = "debug",
+        default_value = PROFILER_TRACING_FILTER,
         hide = true
     )]
     pub samply_filter: String,
+
+    /// Emit traces to tracy. Only useful when profiling.
+    #[arg(long = "log.tracy", global = true, hide = true)]
+    pub tracy: bool,
+
+    /// The filter to use for traces emitted to tracy.
+    #[arg(
+        long = "log.tracy.filter",
+        value_name = "FILTER",
+        global = true,
+        default_value = PROFILER_TRACING_FILTER,
+        hide = true
+    )]
+    pub tracy_filter: String,
 
     /// Sets whether or not the formatter emits ANSI terminal escape codes for colors and other
     /// text formatting.
@@ -91,6 +110,28 @@ pub struct LogArgs {
 }
 
 impl LogArgs {
+    /// The default number of log files for the `node` subcommand.
+    pub const DEFAULT_MAX_LOG_FILES_NODE: usize = 5;
+
+    /// Returns the effective maximum number of log files.
+    ///
+    /// If `log_file_max_files` was explicitly set, returns that value.
+    /// Otherwise returns 0 (file logging disabled).
+    ///
+    /// Note: Callers should apply the node-specific default (5) before calling
+    /// `init_tracing` if the command is the `node` subcommand.
+    pub fn effective_log_file_max_files(&self) -> usize {
+        self.log_file_max_files.unwrap_or(0)
+    }
+
+    /// Applies the default `log_file_max_files` value for the `node` subcommand
+    /// if not explicitly set by the user.
+    pub const fn apply_node_defaults(&mut self) {
+        if self.log_file_max_files.is_none() {
+            self.log_file_max_files = Some(Self::DEFAULT_MAX_LOG_FILES_NODE);
+        }
+    }
+
     /// Creates a [`LayerInfo`] instance.
     fn layer_info(&self, format: LogFormat, filter: String, use_color: bool) -> LayerInfo {
         LayerInfo::new(
@@ -107,7 +148,7 @@ impl LogArgs {
             self.log_file_directory.clone().into(),
             self.log_file_name.clone(),
             self.log_file_max_size * MB_TO_BYTES,
-            self.log_file_max_files,
+            self.effective_log_file_max_files(),
         )
     }
 
@@ -137,7 +178,7 @@ impl LogArgs {
             tracer = tracer.with_journald(self.journald_filter.clone());
         }
 
-        if self.log_file_max_files > 0 {
+        if self.effective_log_file_max_files() > 0 {
             let info = self.file_info();
             let file = self.layer_info(self.log_file_format, self.log_file_filter.clone(), false);
             tracer = tracer.with_file(file, info);
@@ -146,6 +187,18 @@ impl LogArgs {
         if self.samply {
             let config = self.layer_info(LogFormat::Terminal, self.samply_filter.clone(), false);
             tracer = tracer.with_samply(config);
+        }
+
+        if self.tracy {
+            #[cfg(feature = "tracy")]
+            {
+                let config = self.layer_info(LogFormat::Terminal, self.tracy_filter.clone(), false);
+                tracer = tracer.with_tracy(config);
+            }
+            #[cfg(not(feature = "tracy"))]
+            {
+                tracing::warn!("`--log.tracy` requested but `tracy` feature was not compiled in");
+            }
         }
 
         let guard = tracer.init_with_layers(layers)?;

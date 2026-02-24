@@ -8,11 +8,11 @@
 //! modification methods need to be verified against the current revm API.
 
 use alloc::{boxed::Box, format, sync::Arc, vec::Vec};
+use alloy_consensus::TxType;
 use alloy_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor, ExecutableTx},
-    eth::{EthBlockExecutionCtx, EthBlockExecutor},
+    eth::{EthBlockExecutionCtx, EthBlockExecutor, EthTxResult},
     precompiles::PrecompilesMap,
-    revm::context::result::ResultAndState,
     EthEvm, EthEvmFactory,
 };
 use reth_ethereum::{
@@ -41,7 +41,7 @@ use reth_pulsechain_forks::{
     get_effective_chain_id, is_before_primordial_pulse, ETHEREUM_SHANGHAI_TIME,
     PULSECHAIN_PRIMORDIAL_BLOCK,
 };
-use revm::{context::Block as RevmBlock, Database as RevmDatabase};
+use revm::{context::Block as RevmBlock, database::DatabaseCommitExt, Database as RevmDatabase};
 
 use crate::fork_state::{apply_sacrifice_credits, replace_deposit_contract};
 
@@ -455,6 +455,7 @@ where
     type Transaction = TransactionSigned;
     type Receipt = Receipt;
     type Evm = E;
+    type Result = EthTxResult<E::HaltReason, TxType>;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
         // Check if current block is the PrimordialPulse fork block
@@ -554,16 +555,16 @@ where
     fn execute_transaction_without_commit(
         &mut self,
         tx: impl ExecutableTx<Self>,
-    ) -> Result<ResultAndState<E::HaltReason>, BlockExecutionError> {
+    ) -> Result<Self::Result, BlockExecutionError> {
         self.inner.execute_transaction_without_commit(tx)
     }
 
-    fn commit_transaction(
-        &mut self,
-        output: ResultAndState<E::HaltReason>,
-        tx: impl ExecutableTx<Self>,
-    ) -> Result<u64, BlockExecutionError> {
-        self.inner.commit_transaction(output, tx)
+    fn commit_transaction(&mut self, output: Self::Result) -> Result<u64, BlockExecutionError> {
+        self.inner.commit_transaction(output)
+    }
+
+    fn receipts(&self) -> &[Self::Receipt] {
+        self.inner.receipts()
     }
 
     fn finish(self) -> Result<(E, BlockExecutionResult<Receipt>), BlockExecutionError> {

@@ -3,28 +3,28 @@ use super::{
     StaticFileJarProvider, StaticFileProviderRW, StaticFileProviderRWRefMut,
 };
 use crate::{
-    changeset_walker::StaticFileAccountChangesetWalker, to_range, BlockHashReader, BlockNumReader,
-    BlockReader, BlockSource, EitherWriter, EitherWriterDestination, HeaderProvider,
-    ReceiptProvider, StageCheckpointReader, StatsReader, TransactionVariant, TransactionsProvider,
-    TransactionsProviderExt,
+    changeset_walker::{StaticFileAccountChangesetWalker, StaticFileStorageChangesetWalker},
+    to_range, BlockHashReader, BlockNumReader, BlockReader, BlockSource, EitherWriter,
+    EitherWriterDestination, HeaderProvider, ReceiptProvider, StageCheckpointReader, StatsReader,
+    TransactionVariant, TransactionsProvider, TransactionsProviderExt,
 };
 use alloy_consensus::{transaction::TransactionMeta, Header};
 use alloy_eips::{eip2718::Encodable2718, BlockHashOrNumber};
 use alloy_primitives::{b256, keccak256, Address, BlockHash, BlockNumber, TxHash, TxNumber, B256};
-use dashmap::DashMap;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::RwLock;
+use reth_chain_state::ExecutedBlock;
 use reth_chainspec::{ChainInfo, ChainSpecProvider, EthChainSpec, NamedChain};
 use reth_db::{
     lockfile::StorageLock,
     static_file::{
         iter_static_files, BlockHashMask, HeaderMask, HeaderWithHashMask, ReceiptMask,
-        StaticFileCursor, TransactionMask, TransactionSenderMask,
+        StaticFileCursor, StorageChangesetMask, TransactionMask, TransactionSenderMask,
     },
 };
 use reth_db_api::{
     cursor::DbCursorRO,
-    models::StoredBlockBodyIndices,
+    models::{AccountBeforeTx, BlockNumberAddress, StorageBeforeTx, StoredBlockBodyIndices},
     table::{Decompress, Table, Value},
     tables,
     transaction::DbTx,
@@ -32,24 +32,29 @@ use reth_db_api::{
 use reth_ethereum_primitives::{Receipt, TransactionSigned};
 use reth_nippy_jar::{NippyJar, NippyJarChecker, CONFIG_FILE_EXTENSION};
 use reth_node_types::NodePrimitives;
-use reth_primitives_traits::{RecoveredBlock, SealedHeader, SignedTransaction};
-use reth_stages_types::{PipelineTarget, StageId};
+use reth_primitives_traits::{
+    dashmap::DashMap, AlloyBlockHeader as _, BlockBody as _, RecoveredBlock, SealedHeader,
+    SignedTransaction, StorageEntry,
+};
+use reth_prune_types::PruneSegment;
+use reth_stages_types::PipelineTarget;
 use reth_static_file_types::{
-    find_fixed_range, HighestStaticFiles, SegmentHeader, SegmentRangeInclusive, StaticFileSegment,
-    DEFAULT_BLOCKS_PER_STATIC_FILE,
+    find_fixed_range, ChangesetOffsetReader, HighestStaticFiles, SegmentHeader,
+    SegmentRangeInclusive, StaticFileMap, StaticFileSegment, DEFAULT_BLOCKS_PER_STATIC_FILE,
 };
 use reth_storage_api::{
-    BlockBodyIndicesProvider, ChangeSetReader, DBProvider, StorageSettingsCache,
+    BlockBodyIndicesProvider, ChangeSetReader, DBProvider, PruneCheckpointReader,
+    StorageChangeSetReader, StorageSettingsCache,
 };
-use reth_storage_errors::provider::{ProviderError, ProviderResult};
+use reth_storage_errors::provider::{ProviderError, ProviderResult, StaticFileWriterError};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fmt::Debug,
-    ops::{Deref, Range, RangeBounds, RangeInclusive},
+    ops::{Bound, Deref, Range, RangeBounds, RangeInclusive},
     path::{Path, PathBuf},
     sync::{atomic::AtomicU64, mpsc, Arc},
 };
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, info_span, instrument, trace, warn};
 
 /// Alias type for a map that can be queried for block or transaction ranges. It uses `u64` to
 /// represent either a block or a transaction number end of a static file range.
@@ -77,6 +82,27 @@ impl StaticFileAccess {
     }
 }
 
+/// Context for static file block writes.
+///
+/// Contains target segments and pruning configuration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StaticFileWriteCtx {
+    /// Whether transaction senders should be written to static files.
+    pub write_senders: bool,
+    /// Whether receipts should be written to static files.
+    pub write_receipts: bool,
+    /// Whether account changesets should be written to static files.
+    pub write_account_changesets: bool,
+    /// Whether storage changesets should be written to static files.
+    pub write_storage_changesets: bool,
+    /// The current chain tip block number (for pruning).
+    pub tip: BlockNumber,
+    /// The prune mode for receipts, if any.
+    pub receipts_prune_mode: Option<reth_prune_types::PruneMode>,
+    /// Whether receipts are prunable (based on storage settings and prune distance).
+    pub receipts_prunable: bool,
+}
+
 /// [`StaticFileProvider`] manages all existing [`StaticFileJarProvider`].
 ///
 /// "Static files" contain immutable chain history data, such as:
@@ -99,7 +125,7 @@ impl<N> Clone for StaticFileProvider<N> {
 pub struct StaticFileProviderBuilder<P> {
     access: StaticFileAccess,
     use_metrics: bool,
-    blocks_per_file: HashMap<StaticFileSegment, u64>,
+    blocks_per_file: StaticFileMap<u64>,
     path: P,
     genesis_block_number: u64,
 }
@@ -140,9 +166,11 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
     /// setting.
     pub fn with_blocks_per_file_for_segments(
         mut self,
-        segments: HashMap<StaticFileSegment, u64>,
+        segments: &<StaticFileMap<u64> as Deref>::Target,
     ) -> Self {
-        self.blocks_per_file.extend(segments);
+        for (segment, &blocks_per_file) in segments {
+            self.blocks_per_file.insert(segment, blocks_per_file);
+        }
         self
     }
 
@@ -194,7 +222,9 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
             provider.metrics = Some(Arc::new(StaticFileProviderMetrics::default()));
         }
 
-        provider.blocks_per_file.extend(self.blocks_per_file);
+        for (segment, blocks_per_file) in *self.blocks_per_file {
+            provider.blocks_per_file.insert(segment, blocks_per_file);
+        }
         provider.genesis_block_number = self.genesis_block_number;
 
         let provider = StaticFileProvider(Arc::new(provider));
@@ -244,7 +274,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     /// receive `update_index` notifications from a node that appends/truncates data.
     pub fn watch_directory(&self) {
         let provider = self.clone();
-        std::thread::spawn(move || {
+        reth_tasks::spawn_os_thread("sf-watch", move || {
             let (tx, rx) = std::sync::mpsc::channel();
             let mut watcher = RecommendedWatcher::new(
                 move |res| tx.send(res).unwrap(),
@@ -269,7 +299,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                                 notify::EventKind::Create(_) |
                                 notify::EventKind::Remove(_)
                         ) {
-                            continue
+                            continue;
                         }
 
                         // We only trigger a re-initialization if a configuration file was
@@ -282,7 +312,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                                 .extension()
                                 .is_none_or(|s| s.to_str() != Some(CONFIG_FILE_EXTENSION))
                             {
-                                continue
+                                continue;
                             }
 
                             // Ensure it's well formatted static file name
@@ -291,7 +321,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                             )
                             .is_none()
                             {
-                                continue
+                                continue;
                             }
 
                             // If we can read the metadata and modified timestamp, ensure this is
@@ -302,7 +332,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                                 if last_event_timestamp.is_some_and(|last_timestamp| {
                                     last_timestamp >= current_modified_timestamp
                                 }) {
-                                    continue
+                                    continue;
                                 }
                                 last_event_timestamp = Some(current_modified_timestamp);
                             }
@@ -311,7 +341,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                             if let Err(err) = provider.initialize_index() {
                                 warn!(target: "providers::static_file", "failed to re-initialize index: {err}");
                             }
-                            break
+                            break;
                         }
                     }
 
@@ -337,7 +367,7 @@ pub struct StaticFileProviderInner<N> {
     /// segments and ranges.
     map: DashMap<(BlockNumber, StaticFileSegment), LoadedJar>,
     /// Indexes per segment.
-    indexes: RwLock<HashMap<StaticFileSegment, StaticFileSegmentIndex>>,
+    indexes: RwLock<StaticFileMap<StaticFileSegmentIndex>>,
     /// This is an additional index that tracks the expired height, this will track the highest
     /// block number that has been expired (missing). The first, non expired block is
     /// `expired_history_height + 1`.
@@ -358,7 +388,7 @@ pub struct StaticFileProviderInner<N> {
     /// Access rights of the provider.
     access: StaticFileAccess,
     /// Number of blocks per file, per segment.
-    blocks_per_file: HashMap<StaticFileSegment, u64>,
+    blocks_per_file: StaticFileMap<u64>,
     /// Write lock for when access is [`StaticFileAccess::RW`].
     _lock_file: Option<StorageLock>,
     /// Genesis block number, default is 0;
@@ -374,7 +404,7 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
             None
         };
 
-        let mut blocks_per_file = HashMap::new();
+        let mut blocks_per_file = StaticFileMap::default();
         for segment in StaticFileSegment::iter() {
             blocks_per_file.insert(segment, DEFAULT_BLOCKS_PER_STATIC_FILE);
         }
@@ -414,14 +444,14 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
         block: BlockNumber,
     ) -> SegmentRangeInclusive {
         let blocks_per_file =
-            self.blocks_per_file.get(&segment).copied().unwrap_or(DEFAULT_BLOCKS_PER_STATIC_FILE);
+            self.blocks_per_file.get(segment).copied().unwrap_or(DEFAULT_BLOCKS_PER_STATIC_FILE);
 
         if let Some(block_index) = block_index {
             // Find first block range that contains the requested block
             if let Some((_, range)) = block_index.iter().find(|(max_block, _)| block <= **max_block)
             {
                 // Found matching range for an existing file using block index
-                return *range
+                return *range;
             } else if let Some((_, range)) = block_index.last_key_value() {
                 // Didn't find matching range for an existing file, derive a new range from the end
                 // of the last existing file range.
@@ -431,7 +461,7 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
                 let blocks_after_last_range = block - range.end();
                 let segments_to_skip = (blocks_after_last_range - 1) / blocks_per_file;
                 let start = range.end() + 1 + segments_to_skip * blocks_per_file;
-                return SegmentRangeInclusive::new(start, start + blocks_per_file - 1)
+                return SegmentRangeInclusive::new(start, start + blocks_per_file - 1);
             }
         }
         // No block index is available, derive a new range using the fixed number of blocks,
@@ -458,10 +488,7 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
     ) -> SegmentRangeInclusive {
         self.find_fixed_range_with_block_index(
             segment,
-            self.indexes
-                .read()
-                .get(&segment)
-                .map(|index| &index.expected_block_ranges_by_max_block),
+            self.indexes.read().get(segment).map(|index| &index.expected_block_ranges_by_max_block),
             block,
         )
     }
@@ -474,15 +501,18 @@ impl<N: NodePrimitives> StaticFileProviderInner<N> {
 
 impl<N: NodePrimitives> StaticFileProvider<N> {
     /// Reports metrics for the static files.
+    ///
+    /// This uses the in-memory index to get file sizes from mmap handles instead of reading
+    /// filesystem metadata.
     pub fn report_metrics(&self) -> ProviderResult<()> {
         let Some(metrics) = &self.metrics else { return Ok(()) };
 
         let static_files = iter_static_files(&self.path).map_err(ProviderError::other)?;
-        for (segment, headers) in static_files {
+        for (segment, headers) in &*static_files {
             let mut entries = 0;
             let mut size = 0;
 
-            for (block_range, _) in &headers {
+            for (block_range, _) in headers {
                 let fixed_block_range = self.find_fixed_range(segment, block_range.start());
                 let jar_provider = self
                     .get_segment_provider_for_range(segment, || Some(fixed_block_range), None)?
@@ -491,34 +521,265 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     })?;
 
                 entries += jar_provider.rows();
-
-                let data_path = jar_provider.data_path().to_path_buf();
-                let index_path = jar_provider.index_path();
-                let offsets_path = jar_provider.offsets_path();
-                let config_path = jar_provider.config_path();
-
-                // can release jar early
-                drop(jar_provider);
-
-                let data_size = reth_fs_util::metadata(data_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or_default();
-                let index_size = reth_fs_util::metadata(index_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or_default();
-                let offsets_size = reth_fs_util::metadata(offsets_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or_default();
-                let config_size = reth_fs_util::metadata(config_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or_default();
-
-                size += data_size + index_size + offsets_size + config_size;
+                size += jar_provider.size() as u64;
             }
 
             metrics.record_segment(segment, size, headers.len(), entries);
         }
 
+        Ok(())
+    }
+
+    /// Writes headers for all blocks to the static file segment.
+    #[instrument(level = "debug", target = "providers::static_file", skip_all)]
+    fn write_headers(
+        w: &mut StaticFileProviderRWRefMut<'_, N>,
+        blocks: &[ExecutedBlock<N>],
+    ) -> ProviderResult<()> {
+        for block in blocks {
+            let b = block.recovered_block();
+            w.append_header(b.header(), &b.hash())?;
+        }
+        Ok(())
+    }
+
+    /// Writes transactions for all blocks to the static file segment.
+    #[instrument(level = "debug", target = "providers::static_file", skip_all)]
+    fn write_transactions(
+        w: &mut StaticFileProviderRWRefMut<'_, N>,
+        blocks: &[ExecutedBlock<N>],
+        tx_nums: &[TxNumber],
+    ) -> ProviderResult<()> {
+        for (block, &first_tx) in blocks.iter().zip(tx_nums) {
+            let b = block.recovered_block();
+            w.increment_block(b.number())?;
+            for (i, tx) in b.body().transactions().iter().enumerate() {
+                w.append_transaction(first_tx + i as u64, tx)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes transaction senders for all blocks to the static file segment.
+    #[instrument(level = "debug", target = "providers::static_file", skip_all)]
+    fn write_transaction_senders(
+        w: &mut StaticFileProviderRWRefMut<'_, N>,
+        blocks: &[ExecutedBlock<N>],
+        tx_nums: &[TxNumber],
+    ) -> ProviderResult<()> {
+        for (block, &first_tx) in blocks.iter().zip(tx_nums) {
+            let b = block.recovered_block();
+            w.increment_block(b.number())?;
+            for (i, sender) in b.senders_iter().enumerate() {
+                w.append_transaction_sender(first_tx + i as u64, sender)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes receipts for all blocks to the static file segment.
+    #[instrument(level = "debug", target = "providers::static_file", skip_all)]
+    fn write_receipts(
+        w: &mut StaticFileProviderRWRefMut<'_, N>,
+        blocks: &[ExecutedBlock<N>],
+        tx_nums: &[TxNumber],
+        ctx: &StaticFileWriteCtx,
+    ) -> ProviderResult<()> {
+        for (block, &first_tx) in blocks.iter().zip(tx_nums) {
+            let block_number = block.recovered_block().number();
+            w.increment_block(block_number)?;
+
+            // skip writing receipts if pruning configuration requires us to.
+            if ctx.receipts_prunable &&
+                ctx.receipts_prune_mode
+                    .is_some_and(|mode| mode.should_prune(block_number, ctx.tip))
+            {
+                continue
+            }
+
+            for (i, receipt) in block.execution_outcome().receipts.iter().enumerate() {
+                w.append_receipt(first_tx + i as u64, receipt)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes account changesets for all blocks to the static file segment.
+    #[instrument(level = "debug", target = "providers::static_file", skip_all)]
+    fn write_account_changesets(
+        w: &mut StaticFileProviderRWRefMut<'_, N>,
+        blocks: &[ExecutedBlock<N>],
+    ) -> ProviderResult<()> {
+        for block in blocks {
+            let block_number = block.recovered_block().number();
+            let reverts = block.execution_outcome().state.reverts.to_plain_state_reverts();
+
+            let changeset: Vec<_> = reverts
+                .accounts
+                .into_iter()
+                .flatten()
+                .map(|(address, info)| AccountBeforeTx { address, info: info.map(Into::into) })
+                .collect();
+            w.append_account_changeset(changeset, block_number)?;
+        }
+        Ok(())
+    }
+
+    /// Writes storage changesets for all blocks to the static file segment.
+    #[instrument(level = "debug", target = "providers::db", skip_all)]
+    fn write_storage_changesets(
+        w: &mut StaticFileProviderRWRefMut<'_, N>,
+        blocks: &[ExecutedBlock<N>],
+    ) -> ProviderResult<()> {
+        for block in blocks {
+            let block_number = block.recovered_block().number();
+            let reverts = block.execution_outcome().state.reverts.to_plain_state_reverts();
+
+            let changeset: Vec<_> = reverts
+                .storage
+                .into_iter()
+                .flatten()
+                .flat_map(|revert| {
+                    revert.storage_revert.into_iter().map(move |(key, revert_to_slot)| {
+                        StorageBeforeTx {
+                            address: revert.address,
+                            key: B256::from(key.to_be_bytes()),
+                            value: revert_to_slot.to_previous_value(),
+                        }
+                    })
+                })
+                .collect();
+            w.append_storage_changeset(changeset, block_number)?;
+        }
+        Ok(())
+    }
+
+    /// Writes to a static file segment using the provided closure.
+    ///
+    /// The closure receives a mutable reference to the segment writer. After the closure completes,
+    /// `sync_all()` is called to flush writes to disk.
+    #[instrument(level = "debug", target = "providers::static_file", skip_all, fields(?segment))]
+    fn write_segment<F>(
+        &self,
+        segment: StaticFileSegment,
+        first_block_number: BlockNumber,
+        f: F,
+    ) -> ProviderResult<()>
+    where
+        F: FnOnce(&mut StaticFileProviderRWRefMut<'_, N>) -> ProviderResult<()>,
+    {
+        let mut w = self.get_writer(first_block_number, segment)?;
+        f(&mut w)?;
+        w.sync_all()
+    }
+
+    /// Writes all static file data for multiple blocks in parallel per-segment.
+    ///
+    /// This spawns tasks on the storage thread pool for each segment type and each task calls
+    /// `sync_all()` on its writer when done.
+    #[instrument(level = "debug", target = "providers::static_file", skip_all)]
+    pub fn write_blocks_data(
+        &self,
+        blocks: &[ExecutedBlock<N>],
+        tx_nums: &[TxNumber],
+        ctx: StaticFileWriteCtx,
+        runtime: &reth_tasks::Runtime,
+    ) -> ProviderResult<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        let first_block_number = blocks[0].recovered_block().number();
+
+        let mut r_headers = None;
+        let mut r_txs = None;
+        let mut r_senders = None;
+        let mut r_receipts = None;
+        let mut r_account_changesets = None;
+        let mut r_storage_changesets = None;
+
+        // Propagate tracing context into rayon-spawned threads so that per-segment
+        // write spans appear as children of write_blocks_data in traces.
+        let span = tracing::Span::current();
+        runtime.storage_pool().in_place_scope(|s| {
+            s.spawn(|_| {
+                let _guard = span.enter();
+                r_headers =
+                    Some(self.write_segment(StaticFileSegment::Headers, first_block_number, |w| {
+                        Self::write_headers(w, blocks)
+                    }));
+            });
+
+            s.spawn(|_| {
+                let _guard = span.enter();
+                r_txs = Some(self.write_segment(
+                    StaticFileSegment::Transactions,
+                    first_block_number,
+                    |w| Self::write_transactions(w, blocks, tx_nums),
+                ));
+            });
+
+            if ctx.write_senders {
+                s.spawn(|_| {
+                    let _guard = span.enter();
+                    r_senders = Some(self.write_segment(
+                        StaticFileSegment::TransactionSenders,
+                        first_block_number,
+                        |w| Self::write_transaction_senders(w, blocks, tx_nums),
+                    ));
+                });
+            }
+
+            if ctx.write_receipts {
+                s.spawn(|_| {
+                    let _guard = span.enter();
+                    r_receipts = Some(self.write_segment(
+                        StaticFileSegment::Receipts,
+                        first_block_number,
+                        |w| Self::write_receipts(w, blocks, tx_nums, &ctx),
+                    ));
+                });
+            }
+
+            if ctx.write_account_changesets {
+                s.spawn(|_| {
+                    let _guard = span.enter();
+                    r_account_changesets = Some(self.write_segment(
+                        StaticFileSegment::AccountChangeSets,
+                        first_block_number,
+                        |w| Self::write_account_changesets(w, blocks),
+                    ));
+                });
+            }
+
+            if ctx.write_storage_changesets {
+                s.spawn(|_| {
+                    let _guard = span.enter();
+                    r_storage_changesets = Some(self.write_segment(
+                        StaticFileSegment::StorageChangeSets,
+                        first_block_number,
+                        |w| Self::write_storage_changesets(w, blocks),
+                    ));
+                });
+            }
+        });
+
+        r_headers.ok_or(StaticFileWriterError::ThreadPanic("headers"))??;
+        r_txs.ok_or(StaticFileWriterError::ThreadPanic("transactions"))??;
+        if ctx.write_senders {
+            r_senders.ok_or(StaticFileWriterError::ThreadPanic("senders"))??;
+        }
+        if ctx.write_receipts {
+            r_receipts.ok_or(StaticFileWriterError::ThreadPanic("receipts"))??;
+        }
+        if ctx.write_account_changesets {
+            r_account_changesets
+                .ok_or(StaticFileWriterError::ThreadPanic("account_changesets"))??;
+        }
+        if ctx.write_storage_changesets {
+            r_storage_changesets
+                .ok_or(StaticFileWriterError::ThreadPanic("storage_changesets"))??;
+        }
         Ok(())
     }
 
@@ -613,7 +874,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             )
             .and_then(|(parsed_segment, block_range)| {
                 if parsed_segment == segment {
-                    return Some(block_range)
+                    return Some(block_range);
                 }
                 None
             }),
@@ -622,7 +883,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
         // Return cached `LoadedJar` or insert it for the first time, and then, return it.
         if let Some(block_range) = block_range {
-            return Ok(Some(self.get_or_create_jar_provider(segment, &block_range)?))
+            return Ok(Some(self.get_or_create_jar_provider(segment, &block_range)?));
         }
 
         Ok(None)
@@ -677,7 +938,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     ) -> ProviderResult<Vec<SegmentHeader>> {
         // Nothing to delete if block is 0.
         if block == 0 {
-            return Ok(Vec::new())
+            return Ok(Vec::new());
         }
 
         let highest_block = self.get_highest_static_file_block(segment);
@@ -685,16 +946,16 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
         loop {
             let Some(block_height) = self.get_lowest_range_end(segment) else {
-                return Ok(deleted_headers)
+                return Ok(deleted_headers);
             };
 
             // Stop if we've reached the target block or the highest static file
             if block_height >= block || Some(block_height) == highest_block {
-                return Ok(deleted_headers)
+                return Ok(deleted_headers);
             }
 
             debug!(
-                target: "provider::static_file",
+                target: "providers::static_file",
                 ?segment,
                 ?block_height,
                 "Deleting static file below block"
@@ -703,7 +964,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             // now we need to wipe the static file, this will take care of updating the index and
             // advance the lowest tracked block height for the segment.
             let header = self.delete_jar(segment, block_height).inspect_err(|err| {
-                warn!( target: "provider::static_file", ?segment, %block_height, ?err, "Failed to delete static file below block")
+                warn!( target: "providers::static_file", ?segment, %block_height, ?err, "Failed to delete static file below block")
             })?;
 
             deleted_headers.push(header);
@@ -724,12 +985,12 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     ) -> ProviderResult<SegmentHeader> {
         let fixed_block_range = self.find_fixed_range(segment, block);
         let key = (fixed_block_range.end(), segment);
+        let file = self.path.join(segment.filename(&fixed_block_range));
         let jar = if let Some((_, jar)) = self.map.remove(&key) {
             jar.jar
         } else {
-            let file = self.path.join(segment.filename(&fixed_block_range));
             debug!(
-                target: "provider::static_file",
+                target: "providers::static_file",
                 ?file,
                 ?fixed_block_range,
                 ?block,
@@ -739,6 +1000,15 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         };
 
         let header = jar.user_header().clone();
+
+        // Delete the sidecar file for changeset segments before deleting the main jar
+        if segment.is_change_based() {
+            let csoff_path = file.with_extension("csoff");
+            if csoff_path.exists() {
+                std::fs::remove_file(&csoff_path).map_err(ProviderError::other)?;
+            }
+        }
+
         jar.delete().map_err(ProviderError::other)?;
 
         // SAFETY: this is currently necessary to ensure that certain indexes like
@@ -746,6 +1016,34 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         self.initialize_index()?;
 
         Ok(header)
+    }
+
+    /// Deletes ALL static file jars for the given segment, including the highest one.
+    ///
+    /// CAUTION: destructive. Deletes all files on disk for this segment.
+    ///
+    /// This is used for `PruneMode::Full` where all data should be removed.
+    ///
+    /// Returns a list of `SegmentHeader`s from the deleted jars.
+    pub fn delete_segment(&self, segment: StaticFileSegment) -> ProviderResult<Vec<SegmentHeader>> {
+        let mut deleted_headers = Vec::new();
+
+        while let Some(block_height) = self.get_highest_static_file_block(segment) {
+            debug!(
+                target: "providers::static_file",
+                ?segment,
+                ?block_height,
+                "Deleting static file jar"
+            );
+
+            let header = self.delete_jar(segment, block_height).inspect_err(|err| {
+                warn!(target: "providers::static_file", ?segment, %block_height, ?err, "Failed to delete static file jar")
+            })?;
+
+            deleted_headers.push(header);
+        }
+
+        Ok(deleted_headers)
     }
 
     /// Given a segment and block range it returns a cached
@@ -759,12 +1057,12 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         let key = (fixed_block_range.end(), segment);
 
         // Avoid using `entry` directly to avoid a write lock in the common case.
-        trace!(target: "provider::static_file", ?segment, ?fixed_block_range, "Getting provider");
+        trace!(target: "providers::static_file", ?segment, ?fixed_block_range, "Getting provider");
         let mut provider: StaticFileJarProvider<'_, N> = if let Some(jar) = self.map.get(&key) {
-            trace!(target: "provider::static_file", ?segment, ?fixed_block_range, "Jar found in cache");
+            trace!(target: "providers::static_file", ?segment, ?fixed_block_range, "Jar found in cache");
             jar.into()
         } else {
-            trace!(target: "provider::static_file", ?segment, ?fixed_block_range, "Creating jar from scratch");
+            trace!(target: "providers::static_file", ?segment, ?fixed_block_range, "Creating jar from scratch");
             let path = self.path.join(segment.filename(fixed_block_range));
             let jar = NippyJar::load(&path).map_err(ProviderError::other)?;
             self.map.entry(key).insert(LoadedJar::new(jar)?).downgrade().into()
@@ -784,7 +1082,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         block: u64,
     ) -> Option<SegmentRangeInclusive> {
         let indexes = self.indexes.read();
-        let index = indexes.get(&segment)?;
+        let index = indexes.get(segment)?;
 
         (index.max_block >= block).then(|| {
             self.find_fixed_range_with_block_index(
@@ -803,7 +1101,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         tx: u64,
     ) -> Option<SegmentRangeInclusive> {
         let indexes = self.indexes.read();
-        let index = indexes.get(&segment)?;
+        let index = indexes.get(segment)?;
         let available_block_ranges_by_max_tx = index.available_block_ranges_by_max_tx.as_ref()?;
 
         // It's more probable that the request comes from a newer tx height, so we iterate
@@ -813,7 +1111,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         while let Some((tx_end, block_range)) = static_files_rev_iter.next() {
             if tx > *tx_end {
                 // request tx is higher than highest static file tx
-                return None
+                return None;
             }
             let tx_start = static_files_rev_iter.peek().map(|(tx_end, _)| *tx_end + 1).unwrap_or(0);
             if tx_start <= tx {
@@ -821,7 +1119,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     segment,
                     Some(&index.expected_block_ranges_by_max_block),
                     block_range.end(),
-                ))
+                ));
             }
         }
         None
@@ -839,7 +1137,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         segment_max_block: Option<BlockNumber>,
     ) -> ProviderResult<()> {
         debug!(
-            target: "provider::static_file",
+            target: "providers::static_file",
             ?segment,
             ?segment_max_block,
             "Updating provider index"
@@ -850,7 +1148,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             Some(segment_max_block) => {
                 let fixed_range = self.find_fixed_range_with_block_index(
                     segment,
-                    indexes.get(&segment).map(|index| &index.expected_block_ranges_by_max_block),
+                    indexes.get(segment).map(|index| &index.expected_block_ranges_by_max_block),
                     segment_max_block,
                 );
 
@@ -951,20 +1249,20 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 }
 
                 // Update the cached provider.
-                debug!(target: "provider::static_file", ?segment, "Inserting updated jar into cache");
+                debug!(target: "providers::static_file", ?segment, "Inserting updated jar into cache");
                 self.map.insert((fixed_range.end(), segment), LoadedJar::new(jar)?);
 
                 // Delete any cached provider that no longer has an associated jar.
-                debug!(target: "provider::static_file", ?segment, "Cleaning up jar map");
+                debug!(target: "providers::static_file", ?segment, "Cleaning up jar map");
                 self.map.retain(|(end, seg), _| !(*seg == segment && *end > fixed_range.end()));
             }
             None => {
-                debug!(target: "provider::static_file", ?segment, "Removing segment from index");
-                indexes.remove(&segment);
+                debug!(target: "providers::static_file", ?segment, "Removing segment from index");
+                indexes.remove(segment);
             }
         };
 
-        debug!(target: "provider::static_file", ?segment, "Updated provider index");
+        debug!(target: "providers::static_file", ?segment, "Updated provider index");
         Ok(())
     }
 
@@ -973,7 +1271,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         let mut indexes = self.indexes.write();
         indexes.clear();
 
-        for (segment, headers) in iter_static_files(&self.path).map_err(ProviderError::other)? {
+        for (segment, headers) in &*iter_static_files(&self.path).map_err(ProviderError::other)? {
             // Update first and last block for each segment
             //
             // It's safe to call `expect` here, because every segment has at least one header
@@ -995,7 +1293,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
                     available_block_ranges_by_max_tx
                         .get_or_insert_with(BTreeMap::default)
-                        .insert(tx_end, block_range);
+                        .insert(tx_end, *block_range);
                 }
             }
 
@@ -1015,7 +1313,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
         // initialize the expired history height to the lowest static file block
         if let Some(lowest_range) =
-            indexes.get(&StaticFileSegment::Transactions).and_then(|index| index.min_block_range)
+            indexes.get(StaticFileSegment::Transactions).and_then(|index| index.min_block_range)
         {
             // the earliest height is the lowest available block number
             self.earliest_history_height
@@ -1048,6 +1346,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     ///
     /// WARNING: No static file writer should be held before calling this function, otherwise it
     /// will deadlock.
+    #[instrument(skip(self, provider), fields(read_only = self.is_read_only()))]
     pub fn check_consistency<Provider>(
         &self,
         provider: &Provider,
@@ -1056,6 +1355,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         Provider: DBProvider
             + BlockReader
             + StageCheckpointReader
+            + PruneCheckpointReader
             + ChainSpecProvider
             + StorageSettingsCache,
         N: NodePrimitives<Receipt: Value, BlockHeader: Value, SignedTx: Value>,
@@ -1076,26 +1376,35 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 info!(target: "reth::cli",
                     "Skipping storage verification for OP mainnet, expected inconsistency in OVM chain"
                 );
-                return Ok(None)
+                return Ok(None);
             }
         }
 
         info!(target: "reth::cli", "Verifying storage consistency.");
 
         let mut unwind_target: Option<BlockNumber> = None;
-        let mut update_unwind_target = |new_target: BlockNumber| {
-            if let Some(target) = unwind_target.as_mut() {
-                *target = (*target).min(new_target);
-            } else {
-                unwind_target = Some(new_target);
-            }
+
+        let mut update_unwind_target = |new_target| {
+            unwind_target =
+                unwind_target.map(|current| current.min(new_target)).or(Some(new_target));
         };
 
         for segment in self.segments_to_check(provider) {
-            debug!(target: "reth::providers::static_file", ?segment, "Checking consistency for segment");
+            let span = info_span!(
+                "Checking consistency for segment",
+                ?segment,
+                initial_highest_block = tracing::field::Empty,
+                highest_block = tracing::field::Empty,
+                highest_tx = tracing::field::Empty,
+            );
+            let _guard = span.enter();
+
+            debug!(target: "reth::providers::static_file", "Checking consistency for segment");
 
             // Heal file-level inconsistencies and get before/after highest block
             let (initial_highest_block, mut highest_block) = self.maybe_heal_segment(segment)?;
+            span.record("initial_highest_block", initial_highest_block);
+            span.record("highest_block", highest_block);
 
             // Only applies to block-based static files. (Headers)
             //
@@ -1104,9 +1413,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             if initial_highest_block != highest_block {
                 info!(
                     target: "reth::providers::static_file",
-                    ?initial_highest_block,
                     unwind_target = highest_block,
-                    ?segment,
                     "Setting unwind target."
                 );
                 update_unwind_target(highest_block.unwrap_or_default());
@@ -1118,101 +1425,78 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             // from a pruning interruption might have decreased the number of transactions without
             // being able to update the last block of the static file segment.
             let highest_tx = self.get_highest_static_file_tx(segment);
-            debug!(target: "reth::providers::static_file", ?segment, ?highest_tx, ?highest_block, "Highest transaction for segment");
+            span.record("highest_tx", highest_tx);
+            debug!(target: "reth::providers::static_file", "Checking tx index segment");
+
             if let Some(highest_tx) = highest_tx {
                 let mut last_block = highest_block.unwrap_or_default();
-                debug!(target: "reth::providers::static_file", ?segment, last_block, highest_tx, "Verifying last transaction matches last block indices");
+                debug!(target: "reth::providers::static_file", last_block, highest_tx, "Verifying last transaction matches last block indices");
                 loop {
-                    if let Some(indices) = provider.block_body_indices(last_block)? {
-                        debug!(target: "reth::providers::static_file", ?segment, last_block, last_tx_num = indices.last_tx_num(), highest_tx, "Found block body indices");
-                        if indices.last_tx_num() <= highest_tx {
-                            break
-                        }
-                    } else {
-                        debug!(target: "reth::providers::static_file", ?segment, last_block, "Block body indices not found, static files ahead of database");
+                    let Some(indices) = provider.block_body_indices(last_block)? else {
+                        debug!(target: "reth::providers::static_file", last_block, "Block body indices not found, static files ahead of database");
                         // If the block body indices can not be found, then it means that static
                         // files is ahead of database, and the `ensure_invariants` check will fix
                         // it by comparing with stage checkpoints.
                         break
-                    }
-                    if last_block == 0 {
-                        debug!(target: "reth::providers::static_file", ?segment, "Reached block 0 in verification loop");
+                    };
+
+                    debug!(target: "reth::providers::static_file", last_block, last_tx_num = indices.last_tx_num(), "Found block body indices");
+
+                    if indices.last_tx_num() <= highest_tx {
                         break
                     }
+
+                    if last_block == 0 {
+                        debug!(target: "reth::providers::static_file", "Reached block 0 in verification loop");
+                        break
+                    }
+
                     last_block -= 1;
 
                     info!(
                         target: "reth::providers::static_file",
                         highest_block = self.get_highest_static_file_block(segment),
                         unwind_target = last_block,
-                        ?segment,
                         "Setting unwind target."
                     );
+                    span.record("highest_block", last_block);
                     highest_block = Some(last_block);
                     update_unwind_target(last_block);
                 }
             }
 
-            debug!(target: "reth::providers::static_file", ?segment, "Ensuring invariants for segment");
-            if let Some(unwind) = match segment {
-                StaticFileSegment::Headers => self
-                    .ensure_invariants::<_, tables::Headers<N::BlockHeader>>(
-                        provider,
-                        segment,
-                        highest_block,
-                        highest_block,
-                    )?,
-                StaticFileSegment::Transactions => self
-                    .ensure_invariants::<_, tables::Transactions<N::SignedTx>>(
-                        provider,
-                        segment,
-                        highest_tx,
-                        highest_block,
-                    )?,
-                StaticFileSegment::Receipts => self
-                    .ensure_invariants::<_, tables::Receipts<N::Receipt>>(
-                        provider,
-                        segment,
-                        highest_tx,
-                        highest_block,
-                    )?,
-                StaticFileSegment::TransactionSenders => self
-                    .ensure_invariants::<_, tables::TransactionSenders>(
-                        provider,
-                        segment,
-                        highest_tx,
-                        highest_block,
-                    )?,
-                StaticFileSegment::AccountChangeSets => self
-                    .ensure_invariants::<_, tables::AccountChangeSets>(
-                        provider,
-                        segment,
-                        highest_tx,
-                        highest_block,
-                    )?,
-            } {
-                debug!(target: "reth::providers::static_file", ?segment, unwind_target=unwind, "Invariants check returned unwind target");
-                update_unwind_target(unwind);
-            } else {
-                debug!(target: "reth::providers::static_file", ?segment, "Invariants check completed, no unwind needed");
+            debug!(target: "reth::providers::static_file", "Ensuring invariants for segment");
+
+            match self.ensure_invariants_for(provider, segment, highest_tx, highest_block)? {
+                Some(unwind) => {
+                    debug!(target: "reth::providers::static_file", unwind_target=unwind, "Invariants check returned unwind target");
+                    update_unwind_target(unwind);
+                }
+                None => {
+                    debug!(target: "reth::providers::static_file", "Invariants check completed, no unwind needed")
+                }
             }
         }
 
         Ok(unwind_target.map(PipelineTarget::Unwind))
     }
 
-    /// Heals file-level (`NippyJar`) inconsistencies for eligible static file segments.
+    /// Heals file-level (`NippyJar`) inconsistencies for eligible static file
+    /// segments.
     ///
-    /// Call before [`Self::check_consistency`] so files are internally consistent.
-    /// Uses the same segment-skip logic as [`Self::check_consistency`], but does not compare with
-    /// database checkpoints or prune against them.
+    /// Call before [`Self::check_consistency`] so files are internally
+    /// consistent.
+    ///
+    /// Uses the same segment-skip logic as [`Self::check_consistency`], but
+    /// does not compare with database checkpoints or prune against them.
     pub fn check_file_consistency<Provider>(&self, provider: &Provider) -> ProviderResult<()>
     where
-        Provider: DBProvider + ChainSpecProvider + StorageSettingsCache,
+        Provider: DBProvider + ChainSpecProvider + StorageSettingsCache + PruneCheckpointReader,
     {
         info!(target: "reth::cli", "Healing static file inconsistencies.");
 
         for segment in self.segments_to_check(provider) {
+            let _guard = info_span!("healing_static_file_segment", ?segment).entered();
             let _ = self.maybe_heal_segment(segment)?;
         }
 
@@ -1225,19 +1509,20 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         provider: &'a Provider,
     ) -> impl Iterator<Item = StaticFileSegment> + 'a
     where
-        Provider: DBProvider + ChainSpecProvider + StorageSettingsCache,
+        Provider: DBProvider + ChainSpecProvider + StorageSettingsCache + PruneCheckpointReader,
     {
         StaticFileSegment::iter()
             .filter(move |segment| self.should_check_segment(provider, *segment))
     }
 
+    /// True if the given segment should be checked/healed for this provider.
     fn should_check_segment<Provider>(
         &self,
         provider: &Provider,
         segment: StaticFileSegment,
     ) -> bool
     where
-        Provider: DBProvider + ChainSpecProvider + StorageSettingsCache,
+        Provider: DBProvider + ChainSpecProvider + StorageSettingsCache + PruneCheckpointReader,
     {
         match segment {
             StaticFileSegment::Headers | StaticFileSegment::Transactions => true,
@@ -1246,7 +1531,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                     // Old pruned nodes (including full node) do not store receipts as static
                     // files.
                     debug!(target: "reth::providers::static_file", ?segment, "Skipping receipts segment: receipts stored in database");
-                    return false
+                    return false;
                 }
 
                 if NamedChain::Gnosis == provider.chain_spec().chain_id() ||
@@ -1262,11 +1547,28 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 true
             }
             StaticFileSegment::TransactionSenders => {
-                !EitherWriterDestination::senders(provider).is_database()
+                if EitherWriterDestination::senders(provider).is_database() {
+                    debug!(target: "reth::providers::static_file", ?segment, "Skipping senders segment: senders stored in database");
+                    return false;
+                }
+
+                if Self::is_segment_fully_pruned(provider, PruneSegment::SenderRecovery) {
+                    debug!(target: "reth::providers::static_file", ?segment, "Skipping senders segment: fully pruned");
+                    return false;
+                }
+
+                true
             }
             StaticFileSegment::AccountChangeSets => {
                 if EitherWriter::account_changesets_destination(provider).is_database() {
                     debug!(target: "reth::providers::static_file", ?segment, "Skipping account changesets segment: changesets stored in database");
+                    return false;
+                }
+                true
+            }
+            StaticFileSegment::StorageChangeSets => {
+                if EitherWriter::storage_changesets_destination(provider).is_database() {
+                    debug!(target: "reth::providers::static_file", ?segment, "Skipping storage changesets segment: changesets stored in database");
                     return false
                 }
                 true
@@ -1274,23 +1576,39 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         }
     }
 
-    /// Checks consistency of the latest static file segment and throws an error if at fault.
+    /// Returns `true` if the given prune segment has a checkpoint with
+    /// [`reth_prune_types::PruneMode::Full`], indicating all data for this segment has been
+    /// intentionally deleted.
+    fn is_segment_fully_pruned<Provider>(provider: &Provider, segment: PruneSegment) -> bool
+    where
+        Provider: PruneCheckpointReader,
+    {
+        provider
+            .get_prune_checkpoint(segment)
+            .ok()
+            .flatten()
+            .is_some_and(|checkpoint| checkpoint.prune_mode.is_full())
+    }
+
+    /// Checks consistency of the latest static file segment and throws an
+    /// error if at fault.
+    ///
     /// Read-only.
-    pub fn check_segment_consistency(&self, segment: StaticFileSegment) -> ProviderResult<()> {
-        debug!(target: "reth::providers::static_file", ?segment, "Checking segment consistency");
+    fn check_segment_consistency(&self, segment: StaticFileSegment) -> ProviderResult<()> {
+        debug!(target: "reth::providers::static_file", "Checking segment consistency");
         if let Some(latest_block) = self.get_highest_static_file_block(segment) {
             let file_path = self
                 .directory()
                 .join(segment.filename(&self.find_fixed_range(segment, latest_block)));
-            debug!(target: "reth::providers::static_file", ?segment, ?file_path, latest_block, "Loading NippyJar for consistency check");
+            debug!(target: "reth::providers::static_file", ?file_path, latest_block, "Loading NippyJar for consistency check");
 
             let jar = NippyJar::<SegmentHeader>::load(&file_path).map_err(ProviderError::other)?;
-            debug!(target: "reth::providers::static_file", ?segment, "NippyJar loaded, checking consistency");
+            debug!(target: "reth::providers::static_file", "NippyJar loaded, checking consistency");
 
             NippyJarChecker::new(jar).check_consistency().map_err(ProviderError::other)?;
-            debug!(target: "reth::providers::static_file", ?segment, "NippyJar consistency check passed");
+            debug!(target: "reth::providers::static_file", "NippyJar consistency check passed");
         } else {
-            debug!(target: "reth::providers::static_file", ?segment, "No static file block found, skipping consistency check");
+            debug!(target: "reth::providers::static_file", "No static file block found, skipping consistency check");
         }
         Ok(())
     }
@@ -1315,25 +1633,83 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         segment: StaticFileSegment,
     ) -> ProviderResult<(Option<BlockNumber>, Option<BlockNumber>)> {
         let initial_highest_block = self.get_highest_static_file_block(segment);
-        debug!(target: "reth::providers::static_file", ?segment, ?initial_highest_block, "Initial highest block for segment");
+        debug!(target: "reth::providers::static_file", ?initial_highest_block, "Initial highest block for segment");
 
         if self.access.is_read_only() {
             // Read-only mode: cannot modify files, so just validate consistency and error if
             // broken.
-            debug!(target: "reth::providers::static_file", ?segment, "Checking segment consistency (read-only)");
+            debug!(target: "reth::providers::static_file", "Checking segment consistency (read-only)");
             self.check_segment_consistency(segment)?;
         } else {
             // Writable mode: fetching the writer will automatically heal any file-level
             // inconsistency by truncating data to match the last committed config.
-            debug!(target: "reth::providers::static_file", ?segment, "Fetching latest writer which might heal any potential inconsistency");
+            debug!(target: "reth::providers::static_file", "Fetching latest writer which might heal any potential inconsistency");
             self.latest_writer(segment)?;
         }
 
-        // The updated `highest_block` may have decreased if we healed from a pruning
-        // interruption.
+        // The updated `highest_block` may have decreased if we healed from a
+        // pruning interruption.
         let highest_block = self.get_highest_static_file_block(segment);
 
         Ok((initial_highest_block, highest_block))
+    }
+
+    /// Ensure invariants for each corresponding table and static file segment.
+    fn ensure_invariants_for<Provider>(
+        &self,
+        provider: &Provider,
+        segment: StaticFileSegment,
+        highest_tx: Option<u64>,
+        highest_block: Option<BlockNumber>,
+    ) -> ProviderResult<Option<BlockNumber>>
+    where
+        Provider: DBProvider + BlockReader + StageCheckpointReader,
+        N: NodePrimitives<Receipt: Value, BlockHeader: Value, SignedTx: Value>,
+    {
+        match segment {
+            StaticFileSegment::Headers => self
+                .ensure_invariants::<_, tables::Headers<N::BlockHeader>>(
+                    provider,
+                    segment,
+                    highest_block,
+                    highest_block,
+                ),
+            StaticFileSegment::Transactions => self
+                .ensure_invariants::<_, tables::Transactions<N::SignedTx>>(
+                    provider,
+                    segment,
+                    highest_tx,
+                    highest_block,
+                ),
+            StaticFileSegment::Receipts => self
+                .ensure_invariants::<_, tables::Receipts<N::Receipt>>(
+                    provider,
+                    segment,
+                    highest_tx,
+                    highest_block,
+                ),
+            StaticFileSegment::TransactionSenders => self
+                .ensure_invariants::<_, tables::TransactionSenders>(
+                    provider,
+                    segment,
+                    highest_tx,
+                    highest_block,
+                ),
+            StaticFileSegment::AccountChangeSets => self
+                .ensure_invariants::<_, tables::AccountChangeSets>(
+                    provider,
+                    segment,
+                    highest_tx,
+                    highest_block,
+                ),
+            StaticFileSegment::StorageChangeSets => self
+                .ensure_changeset_invariants_by_block::<_, tables::StorageChangeSets, _>(
+                    provider,
+                    segment,
+                    highest_block,
+                    |key| key.block_number(),
+                ),
+        }
     }
 
     /// Check invariants for each corresponding table and static file segment:
@@ -1350,6 +1726,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     ///
     /// * If the database tables overlap with static files and have contiguous keys, or the
     ///   checkpoint block matches the highest static files block, then [`None`] will be returned.
+    #[instrument(skip(self, provider, segment), fields(table = T::NAME))]
     fn ensure_invariants<Provider, T: Table<Key = u64>>(
         &self,
         provider: &Provider,
@@ -1360,11 +1737,11 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     where
         Provider: DBProvider + BlockReader + StageCheckpointReader,
     {
-        debug!(target: "reth::providers::static_file", ?segment, ?highest_static_file_entry, ?highest_static_file_block, "Ensuring invariants");
+        debug!(target: "reth::providers::static_file", "Ensuring invariants");
         let mut db_cursor = provider.tx_ref().cursor_read::<T>()?;
 
         if let Some((db_first_entry, _)) = db_cursor.first()? {
-            debug!(target: "reth::providers::static_file", ?segment, db_first_entry, "Found first database entry");
+            debug!(target: "reth::providers::static_file", db_first_entry, "Found first database entry");
             if let (Some(highest_entry), Some(highest_block)) =
                 (highest_static_file_entry, highest_static_file_block)
             {
@@ -1377,10 +1754,9 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                         ?db_first_entry,
                         ?highest_entry,
                         unwind_target = highest_block,
-                        ?segment,
                         "Setting unwind target."
                     );
-                    return Ok(Some(highest_block))
+                    return Ok(Some(highest_block));
                 }
             }
 
@@ -1388,11 +1764,11 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 highest_static_file_entry
                     .is_none_or(|highest_entry| db_last_entry > highest_entry)
             {
-                debug!(target: "reth::providers::static_file", ?segment, db_last_entry, ?highest_static_file_entry, "Database has entries beyond static files, no unwind needed");
+                debug!(target: "reth::providers::static_file", db_last_entry, "Database has entries beyond static files, no unwind needed");
                 return Ok(None)
             }
         } else {
-            debug!(target: "reth::providers::static_file", ?segment, "No database entries found");
+            debug!(target: "reth::providers::static_file", "No database entries found");
         }
 
         let highest_static_file_entry = highest_static_file_entry.unwrap_or_default();
@@ -1400,19 +1776,148 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
 
         // If static file entry is ahead of the database entries, then ensure the checkpoint block
         // number matches.
-        let stage_id = match segment {
-            StaticFileSegment::Headers => StageId::Headers,
-            StaticFileSegment::Transactions => StageId::Bodies,
-            StaticFileSegment::Receipts | StaticFileSegment::AccountChangeSets => {
-                StageId::Execution
-            }
-            StaticFileSegment::TransactionSenders => StageId::SenderRecovery,
-        };
+        let stage_id = segment.to_stage_id();
         let checkpoint_block_number =
             provider.get_stage_checkpoint(stage_id)?.unwrap_or_default().block_number;
-        debug!(target: "reth::providers::static_file", ?segment, ?stage_id, checkpoint_block_number, highest_static_file_block, "Retrieved stage checkpoint");
+        debug!(target: "reth::providers::static_file", ?stage_id, checkpoint_block_number, "Retrieved stage checkpoint");
 
         // If the checkpoint is ahead, then we lost static file data. May be data corruption.
+        if checkpoint_block_number > highest_static_file_block {
+            info!(
+                target: "reth::providers::static_file",
+                checkpoint_block_number,
+                unwind_target = highest_static_file_block,
+                "Setting unwind target."
+            );
+            return Ok(Some(highest_static_file_block));
+        }
+
+        // If the checkpoint is ahead, or matches, then nothing to do.
+        if checkpoint_block_number >= highest_static_file_block {
+            debug!(target: "reth::providers::static_file", "Invariants ensured, returning None");
+            return Ok(None);
+        }
+
+        // If the checkpoint is behind, then we failed to do a database commit
+        // **but committed** to static files on executing a stage, or the
+        // reverse on unwinding a stage.
+        //
+        // All we need to do is to prune the extra static file rows.
+        info!(
+            target: "reth::providers",
+            from = highest_static_file_block,
+            to = checkpoint_block_number,
+            "Unwinding static file segment."
+        );
+        let mut writer = self.latest_writer(segment)?;
+
+        match segment {
+            StaticFileSegment::Headers => {
+                let prune_count = highest_static_file_block - checkpoint_block_number;
+                debug!(target: "reth::providers::static_file", prune_count, "Pruning headers");
+                // TODO(joshie): is_block_meta
+                writer.prune_headers(prune_count)?;
+            }
+            StaticFileSegment::Transactions |
+            StaticFileSegment::Receipts |
+            StaticFileSegment::TransactionSenders => {
+                if let Some(block) = provider.block_body_indices(checkpoint_block_number)? {
+                    let number = highest_static_file_entry - block.last_tx_num();
+                    debug!(target: "reth::providers::static_file", prune_count = number, checkpoint_block_number, "Pruning transaction based segment");
+
+                    match segment {
+                        StaticFileSegment::Transactions => {
+                            writer.prune_transactions(number, checkpoint_block_number)?
+                        }
+                        StaticFileSegment::Receipts => {
+                            writer.prune_receipts(number, checkpoint_block_number)?
+                        }
+                        StaticFileSegment::TransactionSenders => {
+                            writer.prune_transaction_senders(number, checkpoint_block_number)?
+                        }
+                        StaticFileSegment::Headers |
+                        StaticFileSegment::AccountChangeSets |
+                        StaticFileSegment::StorageChangeSets => {
+                            unreachable!()
+                        }
+                    }
+                } else {
+                    debug!(target: "reth::providers::static_file", checkpoint_block_number, "No block body indices found for checkpoint block");
+                }
+            }
+            StaticFileSegment::AccountChangeSets => {
+                writer.prune_account_changesets(checkpoint_block_number)?;
+            }
+            StaticFileSegment::StorageChangeSets => {
+                writer.prune_storage_changesets(checkpoint_block_number)?;
+            }
+        }
+
+        debug!(target: "reth::providers::static_file", "Committing writer after pruning");
+        writer.commit()?;
+        debug!(target: "reth::providers::static_file", "Writer committed successfully");
+
+        debug!(target: "reth::providers::static_file", "Invariants ensured, returning None");
+        Ok(None)
+    }
+
+    fn ensure_changeset_invariants_by_block<Provider, T, F>(
+        &self,
+        provider: &Provider,
+        segment: StaticFileSegment,
+        highest_static_file_block: Option<BlockNumber>,
+        block_from_key: F,
+    ) -> ProviderResult<Option<BlockNumber>>
+    where
+        Provider: DBProvider + BlockReader + StageCheckpointReader,
+        T: Table,
+        F: Fn(&T::Key) -> BlockNumber,
+    {
+        debug!(
+            target: "reth::providers::static_file",
+            ?segment,
+            ?highest_static_file_block,
+            "Ensuring changeset invariants"
+        );
+        let mut db_cursor = provider.tx_ref().cursor_read::<T>()?;
+
+        if let Some((db_first_key, _)) = db_cursor.first()? {
+            let db_first_block = block_from_key(&db_first_key);
+            if let Some(highest_block) = highest_static_file_block &&
+                !(db_first_block <= highest_block || highest_block + 1 == db_first_block)
+            {
+                info!(
+                    target: "reth::providers::static_file",
+                    ?db_first_block,
+                    ?highest_block,
+                    unwind_target = highest_block,
+                    ?segment,
+                    "Setting unwind target."
+                );
+                return Ok(Some(highest_block))
+            }
+
+            if let Some((db_last_key, _)) = db_cursor.last()? &&
+                highest_static_file_block
+                    .is_none_or(|highest_block| block_from_key(&db_last_key) > highest_block)
+            {
+                debug!(
+                    target: "reth::providers::static_file",
+                    ?segment,
+                    "Database has entries beyond static files, no unwind needed"
+                );
+                return Ok(None)
+            }
+        } else {
+            debug!(target: "reth::providers::static_file", ?segment, "No database entries found");
+        }
+
+        let highest_static_file_block = highest_static_file_block.unwrap_or_default();
+
+        let stage_id = segment.to_stage_id();
+        let checkpoint_block_number =
+            provider.get_stage_checkpoint(stage_id)?.unwrap_or_default().block_number;
+
         if checkpoint_block_number > highest_static_file_block {
             info!(
                 target: "reth::providers::static_file",
@@ -1424,9 +1929,6 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             return Ok(Some(highest_static_file_block))
         }
 
-        // If the checkpoint is behind, then we failed to do a database commit **but committed** to
-        // static files on executing a stage, or the reverse on unwinding a stage.
-        // All we need to do is to prune the extra static file rows.
         if checkpoint_block_number < highest_static_file_block {
             info!(
                 target: "reth::providers",
@@ -1437,47 +1939,17 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
             );
             let mut writer = self.latest_writer(segment)?;
             match segment {
-                StaticFileSegment::Headers => {
-                    let prune_count = highest_static_file_block - checkpoint_block_number;
-                    debug!(target: "reth::providers::static_file", ?segment, prune_count, "Pruning headers");
-                    // TODO(joshie): is_block_meta
-                    writer.prune_headers(prune_count)?;
-                }
-                StaticFileSegment::Transactions |
-                StaticFileSegment::Receipts |
-                StaticFileSegment::TransactionSenders => {
-                    if let Some(block) = provider.block_body_indices(checkpoint_block_number)? {
-                        let number = highest_static_file_entry - block.last_tx_num();
-                        debug!(target: "reth::providers::static_file", ?segment, prune_count = number, checkpoint_block_number, "Pruning transaction based segment");
-
-                        match segment {
-                            StaticFileSegment::Transactions => {
-                                writer.prune_transactions(number, checkpoint_block_number)?
-                            }
-                            StaticFileSegment::Receipts => {
-                                writer.prune_receipts(number, checkpoint_block_number)?
-                            }
-                            StaticFileSegment::TransactionSenders => {
-                                writer.prune_transaction_senders(number, checkpoint_block_number)?
-                            }
-                            StaticFileSegment::Headers | StaticFileSegment::AccountChangeSets => {
-                                unreachable!()
-                            }
-                        }
-                    } else {
-                        debug!(target: "reth::providers::static_file", ?segment, checkpoint_block_number, "No block body indices found for checkpoint block");
-                    }
-                }
                 StaticFileSegment::AccountChangeSets => {
                     writer.prune_account_changesets(checkpoint_block_number)?;
                 }
+                StaticFileSegment::StorageChangeSets => {
+                    writer.prune_storage_changesets(checkpoint_block_number)?;
+                }
+                _ => unreachable!("invalid segment for changeset invariants"),
             }
-            debug!(target: "reth::providers::static_file", ?segment, "Committing writer after pruning");
             writer.commit()?;
-            debug!(target: "reth::providers::static_file", ?segment, "Writer committed successfully");
         }
 
-        debug!(target: "reth::providers::static_file", ?segment, "Invariants ensured, returning None");
         Ok(None)
     }
 
@@ -1496,7 +1968,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     ///
     /// If there is nothing on disk for the given segment, this will return [`None`].
     pub fn get_lowest_range(&self, segment: StaticFileSegment) -> Option<SegmentRangeInclusive> {
-        self.indexes.read().get(&segment).and_then(|index| index.min_block_range)
+        self.indexes.read().get(segment).and_then(|index| index.min_block_range)
     }
 
     /// Gets the lowest static file's block range start if it exists for a static file segment.
@@ -1521,7 +1993,34 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     ///
     /// If there is nothing on disk for the given segment, this will return [`None`].
     pub fn get_highest_static_file_block(&self, segment: StaticFileSegment) -> Option<BlockNumber> {
-        self.indexes.read().get(&segment).map(|index| index.max_block)
+        self.indexes.read().get(segment).map(|index| index.max_block)
+    }
+
+    /// Converts a range to a bounded `RangeInclusive` capped to the highest static file block.
+    ///
+    /// This is necessary because static file iteration beyond the tip would loop forever:
+    /// blocks beyond the static file tip return `Ok(empty)` which is indistinguishable from
+    /// blocks with no changes. We cap the end to the highest available block regardless of
+    /// whether the input was unbounded or an explicit large value like `BlockNumber::MAX`.
+    fn bound_range(
+        &self,
+        range: impl RangeBounds<BlockNumber>,
+        segment: StaticFileSegment,
+    ) -> RangeInclusive<BlockNumber> {
+        let highest_block = self.get_highest_static_file_block(segment).unwrap_or(0);
+
+        let start = match range.start_bound() {
+            Bound::Included(&n) => n,
+            Bound::Excluded(&n) => n.saturating_add(1),
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(&n) => n.min(highest_block),
+            Bound::Excluded(&n) => n.saturating_sub(1).min(highest_block),
+            Bound::Unbounded => highest_block,
+        };
+
+        start..=end
     }
 
     /// Gets the highest static file transaction.
@@ -1530,7 +2029,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     pub fn get_highest_static_file_tx(&self, segment: StaticFileSegment) -> Option<TxNumber> {
         self.indexes
             .read()
-            .get(&segment)
+            .get(segment)
             .and_then(|index| index.available_block_ranges_by_max_tx.as_ref())
             .and_then(|index| index.last_key_value().map(|(last_tx, _)| *last_tx))
     }
@@ -1550,12 +2049,12 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         func: impl Fn(StaticFileJarProvider<'_, N>) -> ProviderResult<Option<T>>,
     ) -> ProviderResult<Option<T>> {
         if let Some(ranges) =
-            self.indexes.read().get(&segment).map(|index| &index.expected_block_ranges_by_max_block)
+            self.indexes.read().get(segment).map(|index| &index.expected_block_ranges_by_max_block)
         {
             // Iterate through all ranges in reverse order (highest to lowest)
             for range in ranges.values().rev() {
                 if let Some(res) = func(self.get_or_create_jar_provider(segment, range)?)? {
-                    return Ok(Some(res))
+                    return Ok(Some(res));
                 }
             }
         }
@@ -1612,14 +2111,14 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
                 match get_fn(&mut cursor, number)? {
                     Some(res) => {
                         if !predicate(&res) {
-                            break 'outer
+                            break 'outer;
                         }
                         result.push(res);
-                        break 'inner
+                        break 'inner;
                     }
                     None => {
                         if retrying {
-                            return Ok(result)
+                            return Ok(result);
                         }
                         // There is a very small chance of hitting a deadlock if two consecutive
                         // static files share the same bucket in the
@@ -1713,7 +2212,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
         if static_file_upper_bound
             .is_some_and(|static_file_upper_bound| static_file_upper_bound >= number)
         {
-            return fetch_from_static_file(self)
+            return fetch_from_static_file(self);
         }
         fetch_from_database()
     }
@@ -1778,7 +2277,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     pub fn tx_index(&self, segment: StaticFileSegment) -> Option<SegmentRanges> {
         self.indexes
             .read()
-            .get(&segment)
+            .get(segment)
             .and_then(|index| index.available_block_ranges_by_max_tx.as_ref())
             .cloned()
     }
@@ -1788,7 +2287,7 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     pub fn expected_block_index(&self, segment: StaticFileSegment) -> Option<SegmentRanges> {
         self.indexes
             .read()
-            .get(&segment)
+            .get(segment)
             .map(|index| &index.expected_block_ranges_by_max_block)
             .cloned()
     }
@@ -1849,6 +2348,11 @@ pub trait StaticFileWriter {
 
     /// Returns `true` if the static file provider has unwind queued.
     fn has_unwind_queued(&self) -> bool;
+
+    /// Finalizes all static file writers by committing their configuration to disk.
+    ///
+    /// Returns an error if prune is queued (use [`Self::commit`] instead).
+    fn finalize(&self) -> ProviderResult<()>;
 }
 
 impl<N: NodePrimitives> StaticFileWriter for StaticFileProvider<N> {
@@ -1860,10 +2364,10 @@ impl<N: NodePrimitives> StaticFileWriter for StaticFileProvider<N> {
         segment: StaticFileSegment,
     ) -> ProviderResult<StaticFileProviderRWRefMut<'_, Self::Primitives>> {
         if self.access.is_read_only() {
-            return Err(ProviderError::ReadOnlyStaticFileAccess)
+            return Err(ProviderError::ReadOnlyStaticFileAccess);
         }
 
-        trace!(target: "provider::static_file", ?block, ?segment, "Getting static file writer.");
+        trace!(target: "providers::static_file", ?block, ?segment, "Getting static file writer.");
         self.writers.get_or_create(segment, || {
             StaticFileProviderRW::new(segment, block, Arc::downgrade(&self.0), self.metrics.clone())
         })
@@ -1887,6 +2391,10 @@ impl<N: NodePrimitives> StaticFileWriter for StaticFileProvider<N> {
     fn has_unwind_queued(&self) -> bool {
         self.writers.has_unwind_queued()
     }
+
+    fn finalize(&self) -> ProviderResult<()> {
+        self.writers.finalize()
+    }
 }
 
 impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
@@ -1904,7 +2412,7 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
             Err(err) => return Err(err),
         };
 
-        if let Some(offset) = provider.user_header().changeset_offset(block_number) {
+        if let Some(offset) = provider.read_changeset_offset(block_number)? {
             let mut cursor = provider.cursor()?;
             let mut changeset = Vec::with_capacity(offset.num_changes() as usize);
 
@@ -1936,9 +2444,7 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
             Err(err) => return Err(err),
         };
 
-        let user_header = provider.user_header();
-
-        let Some(offset) = user_header.changeset_offset(block_number) else {
+        let Some(offset) = provider.read_changeset_offset(block_number)? else {
             return Ok(None);
         };
 
@@ -1961,7 +2467,7 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
                 // This is not expected but means we are out of the range / file somehow, and can't
                 // continue
                 debug!(
-                    target: "provider::static_file",
+                    target: "providers::static_file",
                     ?low,
                     ?mid,
                     ?high,
@@ -1990,18 +2496,152 @@ impl<N: NodePrimitives> ChangeSetReader for StaticFileProvider<N> {
         &self,
         range: impl core::ops::RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<(BlockNumber, reth_db::models::AccountBeforeTx)>> {
+        let range = self.bound_range(range, StaticFileSegment::AccountChangeSets);
         self.walk_account_changeset_range(range).collect()
     }
 
     fn account_changeset_count(&self) -> ProviderResult<usize> {
         let mut count = 0;
 
-        // iterate through static files and sum changeset metadata via each static file header
         let static_files = iter_static_files(&self.path).map_err(ProviderError::other)?;
-        if let Some(changeset_segments) = static_files.get(&StaticFileSegment::AccountChangeSets) {
-            for (_, header) in changeset_segments {
-                if let Some(changeset_offsets) = header.changeset_offsets() {
-                    for offset in changeset_offsets {
+        if let Some(changeset_segments) = static_files.get(StaticFileSegment::AccountChangeSets) {
+            for (block_range, header) in changeset_segments {
+                let csoff_path = self
+                    .path
+                    .join(StaticFileSegment::AccountChangeSets.filename(block_range))
+                    .with_extension("csoff");
+                if csoff_path.exists() {
+                    let len = header.changeset_offsets_len();
+                    let mut reader = ChangesetOffsetReader::new(&csoff_path, len)
+                        .map_err(ProviderError::other)?;
+                    let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
+                    for offset in offsets {
+                        count += offset.num_changes() as usize;
+                    }
+                }
+            }
+        }
+
+        Ok(count)
+    }
+}
+
+impl<N: NodePrimitives> StorageChangeSetReader for StaticFileProvider<N> {
+    fn storage_changeset(
+        &self,
+        block_number: BlockNumber,
+    ) -> ProviderResult<Vec<(BlockNumberAddress, StorageEntry)>> {
+        let provider = match self.get_segment_provider_for_block(
+            StaticFileSegment::StorageChangeSets,
+            block_number,
+            None,
+        ) {
+            Ok(provider) => provider,
+            Err(ProviderError::MissingStaticFileBlock(_, _)) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+
+        if let Some(offset) = provider.read_changeset_offset(block_number)? {
+            let mut cursor = provider.cursor()?;
+            let mut changeset = Vec::with_capacity(offset.num_changes() as usize);
+
+            for i in offset.changeset_range() {
+                if let Some(change) = cursor.get_one::<StorageChangesetMask>(i.into())? {
+                    let block_address = BlockNumberAddress((block_number, change.address));
+                    let entry = StorageEntry { key: change.key, value: change.value };
+                    changeset.push((block_address, entry));
+                }
+            }
+            Ok(changeset)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn get_storage_before_block(
+        &self,
+        block_number: BlockNumber,
+        address: Address,
+        storage_key: B256,
+    ) -> ProviderResult<Option<StorageEntry>> {
+        let provider = match self.get_segment_provider_for_block(
+            StaticFileSegment::StorageChangeSets,
+            block_number,
+            None,
+        ) {
+            Ok(provider) => provider,
+            Err(ProviderError::MissingStaticFileBlock(_, _)) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+
+        let Some(offset) = provider.read_changeset_offset(block_number)? else {
+            return Ok(None);
+        };
+
+        let mut cursor = provider.cursor()?;
+        let range = offset.changeset_range();
+        let mut low = range.start;
+        let mut high = range.end;
+
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if let Some(change) = cursor.get_one::<StorageChangesetMask>(mid.into())? {
+                match (change.address, change.key).cmp(&(address, storage_key)) {
+                    std::cmp::Ordering::Less => low = mid + 1,
+                    _ => high = mid,
+                }
+            } else {
+                debug!(
+                    target: "providers::static_file",
+                    ?low,
+                    ?mid,
+                    ?high,
+                    ?range,
+                    ?block_number,
+                    ?address,
+                    ?storage_key,
+                    "Cannot continue binary search for storage changeset fetch"
+                );
+                low = range.end;
+                break;
+            }
+        }
+
+        if low < range.end &&
+            let Some(change) = cursor
+                .get_one::<StorageChangesetMask>(low.into())?
+                .filter(|change| change.address == address && change.key == storage_key)
+        {
+            return Ok(Some(StorageEntry { key: change.key, value: change.value }));
+        }
+
+        Ok(None)
+    }
+
+    fn storage_changesets_range(
+        &self,
+        range: impl RangeBounds<BlockNumber>,
+    ) -> ProviderResult<Vec<(BlockNumberAddress, StorageEntry)>> {
+        let range = self.bound_range(range, StaticFileSegment::StorageChangeSets);
+        self.walk_storage_changeset_range(range).collect()
+    }
+
+    fn storage_changeset_count(&self) -> ProviderResult<usize> {
+        let mut count = 0;
+
+        let static_files = iter_static_files(&self.path).map_err(ProviderError::other)?;
+        if let Some(changeset_segments) = static_files.get(StaticFileSegment::StorageChangeSets) {
+            for (block_range, header) in changeset_segments {
+                let csoff_path = self
+                    .path
+                    .join(StaticFileSegment::StorageChangeSets.filename(block_range))
+                    .with_extension("csoff");
+                if csoff_path.exists() {
+                    let len = header.changeset_offsets_len();
+                    let mut reader = ChangesetOffsetReader::new(&csoff_path, len)
+                        .map_err(ProviderError::other)?;
+                    let offsets = reader.get_range(0, len).map_err(ProviderError::other)?;
+                    for offset in offsets {
                         count += offset.num_changes() as usize;
                     }
                 }
@@ -2028,6 +2668,14 @@ impl<N: NodePrimitives> StaticFileProvider<N> {
     ) -> StaticFileAccountChangesetWalker<Self> {
         StaticFileAccountChangesetWalker::new(self.clone(), range)
     }
+
+    /// Creates an iterator for walking through storage changesets in the specified block range.
+    pub fn walk_storage_changeset_range(
+        &self,
+        range: impl RangeBounds<BlockNumber>,
+    ) -> StaticFileStorageChangesetWalker<Self> {
+        StaticFileStorageChangesetWalker::new(self.clone(), range)
+    }
 }
 
 impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileProvider<N> {
@@ -2040,7 +2688,7 @@ impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileProvide
                 .get_two::<HeaderWithHashMask<Self::Header>>((&block_hash).into())?
                 .and_then(|(header, hash)| {
                     if hash == block_hash {
-                        return Some(header)
+                        return Some(header);
                     }
                     None
                 }))
@@ -2150,7 +2798,7 @@ impl<N: NodePrimitives<SignedTx: Value + SignedTransaction, Receipt: Value>> Rec
 
     fn receipt_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Receipt>> {
         if let Some(num) = self.transaction_id(hash)? {
-            return self.receipt(num)
+            return self.receipt(num);
         }
         Ok(None)
     }
