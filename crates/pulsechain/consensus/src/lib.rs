@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn test_is_pos_header_detection() {
         use alloy_primitives::U256;
-        use reth_primitives::Header;
+        use reth_primitives_traits::Header;
 
         // Headers with difficulty == 0 should be PoS
         assert!(PulseChainBeaconConsensus::<reth_chainspec::ChainSpec>::is_pos_header(&Header {
