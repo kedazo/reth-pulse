@@ -148,7 +148,12 @@ impl ConfigureEvm for PulseChainEvmConfig {
             && header.timestamp >= ETHEREUM_SHANGHAI_TIME
             && env.cfg_env.spec < SpecId::SHANGHAI
         {
-            env.cfg_env.spec = SpecId::SHANGHAI;
+            // CRITICAL: Must use set_spec_and_mainnet_gas_params() instead of just
+            // setting spec. In revm 34.0.0, gas costs are in a separate GasParams
+            // table initialized at CfgEnv creation. Just setting spec doesn't update
+            // the gas table, so Shanghai gas costs (EIP-3860 initcode word cost) are
+            // missing.
+            env.cfg_env.set_spec_and_mainnet_gas_params(SpecId::SHANGHAI);
         }
 
         Ok(env)
@@ -171,7 +176,8 @@ impl ConfigureEvm for PulseChainEvmConfig {
             && attributes.timestamp >= ETHEREUM_SHANGHAI_TIME
             && env.cfg_env.spec < SpecId::SHANGHAI
         {
-            env.cfg_env.spec = SpecId::SHANGHAI;
+            // Must update both spec AND gas_params (see evm_env() comment above)
+            env.cfg_env.set_spec_and_mainnet_gas_params(SpecId::SHANGHAI);
         }
 
         Ok(env)
