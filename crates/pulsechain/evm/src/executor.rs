@@ -11,9 +11,8 @@ use alloc::{boxed::Box, format, sync::Arc, vec::Vec};
 use alloy_consensus::TxType;
 use alloy_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor, ExecutableTx},
-    eth::{EthBlockExecutionCtx, EthBlockExecutor, EthTxResult},
+    eth::{EthBlockExecutionCtx, EthBlockExecutor, EthEvm, EthEvmFactory, EthTxResult},
     precompiles::PrecompilesMap,
-    EthEvm, EthEvmFactory,
 };
 use reth_ethereum::{
     chainspec::ChainSpec,
@@ -58,9 +57,7 @@ where
     type EVM = PulseChainEvmConfig;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        let evm_config = PulseChainEvmConfig { inner: EthEvmConfig::new(ctx.chain_spec()) };
-
-        Ok(evm_config)
+        Ok(PulseChainEvmConfig { inner: EthEvmConfig::new(ctx.chain_spec()) })
     }
 }
 
@@ -122,6 +119,8 @@ impl ConfigureEvm for PulseChainEvmConfig {
     fn evm_env(&self, header: &Header) -> Result<EvmEnv<SpecId>, Self::Error> {
         let mut env = self.inner.evm_env(header)?;
 
+        let original_spec = env.cfg_env.spec;
+
         // Override chain ID based on block number
         // Pre-fork (< 17,233,000): chain ID = 1 (Ethereum)
         // Post-fork (>= 17,233,000): chain ID = 369 (PulseChain)
@@ -146,7 +145,7 @@ impl ConfigureEvm for PulseChainEvmConfig {
         // rules, causing gas mismatches from missing EIP-3651/3855/3860.
         if is_before_primordial_pulse(header.number)
             && header.timestamp >= ETHEREUM_SHANGHAI_TIME
-            && env.cfg_env.spec < SpecId::SHANGHAI
+            && original_spec < SpecId::SHANGHAI
         {
             // CRITICAL: Must use set_spec_and_mainnet_gas_params() instead of just
             // setting spec. In revm 34.0.0, gas costs are in a separate GasParams
@@ -651,19 +650,22 @@ where
             && block_timestamp >= ETHEREUM_SHANGHAI_TIME
             && !self.inner.spec.is_shanghai_active_at_timestamp(block_timestamp)
         {
-            // Collect withdrawal balance increments before self.inner is consumed
-            let withdrawal_increments: Vec<_> = self
-                .inner
-                .ctx
-                .withdrawals
-                .as_ref()
-                .map(|ws| {
-                    ws.iter()
-                        .filter(|w| w.amount > 0)
-                        .map(|w| (w.address, w.amount_wei().to::<u128>()))
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Collect withdrawal balance increments before self.inner is consumed.
+            // CRITICAL: Must aggregate by address! Multiple withdrawals can go to the
+            // same address in a single block. increment_balances() reads the starting
+            // balance for each entry independently before committing, so duplicate
+            // addresses would only apply the last withdrawal's amount instead of the sum.
+            let withdrawal_increments: Vec<_> = {
+                let mut map = alloc::collections::BTreeMap::<alloy_primitives::Address, u128>::new();
+                if let Some(ws) = self.inner.ctx.withdrawals.as_ref() {
+                    for w in ws.iter() {
+                        if w.amount > 0 {
+                            *map.entry(w.address).or_default() += w.amount_wei().to::<u128>();
+                        }
+                    }
+                }
+                map.into_iter().collect()
+            };
 
             // inner.finish() handles block rewards, DAO fork, etc. but skips withdrawals
             let (mut evm, result) = self.inner.finish()?;
