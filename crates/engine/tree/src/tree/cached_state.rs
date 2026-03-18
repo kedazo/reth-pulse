@@ -5,7 +5,6 @@ use alloy_primitives::{
 };
 use fixed_cache::{AnyRef, CacheConfig, Stats, StatsHandler};
 use metrics::{Counter, Gauge, Histogram};
-use parking_lot::Once;
 use reth_errors::ProviderResult;
 use reth_metrics::Metrics;
 use reth_primitives_traits::{Account, Bytecode};
@@ -512,8 +511,6 @@ struct ExecutionCacheInner {
     /// Stats handler for the account cache (shared with the cache via [`Stats`]).
     account_stats: Arc<CacheStatsHandler>,
 
-    /// One-time notification when SELFDESTRUCT is encountered
-    selfdestruct_encountered: Once,
 }
 
 impl ExecutionCache {
@@ -561,7 +558,6 @@ impl ExecutionCache {
             code_stats,
             storage_stats,
             account_stats,
-            selfdestruct_encountered: Once::new(),
         }))
     }
 
@@ -693,17 +689,21 @@ impl ExecutionCache {
                 let had_code =
                     account.original_info.as_ref().is_some_and(|info| !info.is_empty_code_hash());
                 if had_code {
-                    self.0.selfdestruct_encountered.call_once(|| {
-                        warn!(
-                            target: "engine::caching",
-                            address = ?addr,
-                            info = ?account.info,
-                            original_info = ?account.original_info,
-                            "Encountered an inter-transaction SELFDESTRUCT that reset the storage cache. Are you running a pre-Dencun network?"
-                        );
-                    });
-                    self.clear();
-                    return Ok(())
+                    // PulseChain is pre-Dencun so SELFDESTRUCT is active. Upstream reth
+                    // clears the entire cache here because FixedCache can't efficiently
+                    // remove all storage entries for a single address. This causes 46s+
+                    // state root recomputation on every SELFDESTRUCT.
+                    //
+                    // Instead, we zero out the destroyed contract's known storage slots
+                    // and remove it from the account cache. Stale storage entries from
+                    // prior blocks may remain cached, but they won't cause issues because:
+                    // - The account itself is removed from account_cache
+                    // - EVM checks account existence before reading storage
+                    // - If the account is re-created (CREATE2), the new storage starts
+                    //   fresh and any reads will go through the state provider
+                    for (key, _slot) in &account.storage {
+                        self.insert_storage(*addr, (*key).into(), Some(StorageValue::ZERO));
+                    }
                 }
 
                 self.0.account_cache.remove(addr);

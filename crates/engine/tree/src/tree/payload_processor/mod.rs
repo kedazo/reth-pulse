@@ -77,7 +77,7 @@ pub const PARALLEL_SPARSE_TRIE_PARALLELISM_THRESHOLDS: ParallelismThresholds =
 ///
 /// If we have 1 million entries of 120 bytes each, this conservative estimate comes out at around
 /// 120MB.
-pub const SPARSE_TRIE_MAX_NODES_SHRINK_CAPACITY: usize = 1_000_000;
+pub const SPARSE_TRIE_MAX_NODES_SHRINK_CAPACITY: usize = 3_000_000;
 
 /// Default value capacity for shrinking the sparse trie. This is used to limit the number of values
 /// in allocated sparse tries.
@@ -90,7 +90,7 @@ pub const SPARSE_TRIE_MAX_NODES_SHRINK_CAPACITY: usize = 1_000_000;
 ///
 /// If we have 1 million entries of 144 bytes each, this conservative estimate comes out at around
 /// 144MB.
-pub const SPARSE_TRIE_MAX_VALUES_SHRINK_CAPACITY: usize = 1_000_000;
+pub const SPARSE_TRIE_MAX_VALUES_SHRINK_CAPACITY: usize = 3_000_000;
 
 /// Blocks with fewer transactions than this skip prewarming, since the fixed overhead of spawning
 /// prewarm workers exceeds the execution time saved.
