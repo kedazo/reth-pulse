@@ -591,22 +591,17 @@ where
             let mut guard = preserved_sparse_trie.lock();
 
             // Send state root computation result - next block may start but will block on take()
-            if state_root_tx.send(result).is_err() {
-                // Receiver dropped - payload was likely invalid or cancelled.
-                // Clear the trie instead of preserving potentially invalid state.
+            let receiver_dropped = state_root_tx.send(result).is_err();
+            if receiver_dropped {
+                // Receiver dropped - sequential fallback may have won the race,
+                // or payload was cancelled. We still preserve the trie if computation
+                // succeeded, because clearing it forces the next block to rebuild
+                // from scratch (very slow for large state tries like PulseChain).
                 debug!(
                     target: "engine::tree::payload_processor",
-                    "State root receiver dropped, clearing trie"
+                    ?computed_state_root,
+                    "State root receiver dropped"
                 );
-                let (trie, deferred) = task.into_cleared_trie(
-                    SPARSE_TRIE_MAX_NODES_SHRINK_CAPACITY,
-                    SPARSE_TRIE_MAX_VALUES_SHRINK_CAPACITY,
-                );
-                guard.store(PreservedSparseTrie::cleared(trie));
-                // Drop guard before deferred to release lock before expensive deallocations
-                drop(guard);
-                drop(deferred);
-                return;
             }
 
             // Only preserve the trie as anchored if computation succeeded.
