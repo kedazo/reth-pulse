@@ -3,7 +3,11 @@
 use alloy_primitives::B256;
 use parking_lot::Mutex;
 use reth_trie_sparse::SparseStateTrie;
-use std::{sync::Arc, time::Instant};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::Instant;
 use tracing::debug;
 
 /// Type alias for the sparse trie type used in preservation.
@@ -13,20 +17,87 @@ pub(super) type SparseTrie = SparseStateTrie;
 ///
 /// This is stored in [`PayloadProcessor`](super::PayloadProcessor) and cloned to pass to
 /// [`SparseTrieCacheTask`](super::sparse_trie::SparseTrieCacheTask) for trie reuse.
-#[derive(Debug, Default, Clone)]
-pub(super) struct SharedPreservedSparseTrie(Arc<Mutex<Option<PreservedSparseTrie>>>);
+#[derive(Debug, Clone)]
+pub(super) struct SharedPreservedSparseTrie {
+    trie: Arc<Mutex<Option<PreservedSparseTrie>>>,
+    /// Set to true while a sparse trie task is running. Used by `take_or_wait()`
+    /// to decide whether to wait for the trie to become available.
+    task_in_flight: Arc<AtomicBool>,
+}
+
+impl Default for SharedPreservedSparseTrie {
+    fn default() -> Self {
+        Self {
+            trie: Arc::new(Mutex::new(None)),
+            task_in_flight: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
 
 impl SharedPreservedSparseTrie {
-    /// Takes the preserved trie if present, leaving `None` in its place.
-    pub(super) fn take(&self) -> Option<PreservedSparseTrie> {
-        self.0.lock().take()
+    /// Takes the preserved trie if present. If `None` and a task is currently
+    /// in flight (computing), waits up to `max_wait` for the trie to become
+    /// available before giving up.
+    ///
+    /// This prevents the new task from starting cold when the previous task
+    /// hasn't finished storing the trie yet.
+    pub(super) fn take_or_wait(
+        &self,
+        max_wait: std::time::Duration,
+    ) -> Option<PreservedSparseTrie> {
+        // Fast path: trie is available
+        if let Some(trie) = self.trie.lock().take() {
+            return Some(trie);
+        }
+
+        // If no task is in flight, the trie is genuinely empty (e.g., first block)
+        if !self.task_in_flight.load(Ordering::Acquire) {
+            return None;
+        }
+
+        // A task is in flight — wait for it to store the trie
+        let start = Instant::now();
+        while start.elapsed() < max_wait {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+
+            if let Some(trie) = self.trie.lock().take() {
+                debug!(
+                    target: "engine::tree::payload_processor",
+                    waited=?start.elapsed(),
+                    "Retrieved trie after waiting for in-flight task"
+                );
+                return Some(trie);
+            }
+
+            // Task finished without storing (error case)
+            if !self.task_in_flight.load(Ordering::Acquire) {
+                return None;
+            }
+        }
+
+        debug!(
+            target: "engine::tree::payload_processor",
+            waited=?max_wait,
+            "Timed out waiting for in-flight task to store trie"
+        );
+        None
+    }
+
+    /// Marks that a task has started computing.
+    pub(super) fn set_task_in_flight(&self) {
+        self.task_in_flight.store(true, Ordering::Release);
+    }
+
+    /// Marks that a task has finished computing.
+    pub(super) fn clear_task_in_flight(&self) {
+        self.task_in_flight.store(false, Ordering::Release);
     }
 
     /// Acquires a guard that blocks `take()` until dropped.
     /// Use this before sending the state root result to ensure the next block
     /// waits for the trie to be stored.
     pub(super) fn lock(&self) -> PreservedTrieGuard<'_> {
-        PreservedTrieGuard(self.0.lock())
+        PreservedTrieGuard(self.trie.lock())
     }
 
     /// Waits until the sparse trie lock becomes available.
@@ -38,7 +109,7 @@ impl SharedPreservedSparseTrie {
     /// Returns the time spent waiting for the lock.
     pub(super) fn wait_for_availability(&self) -> std::time::Duration {
         let start = Instant::now();
-        let _guard = self.0.lock();
+        let _guard = self.trie.lock();
         let elapsed = start.elapsed();
         if elapsed.as_millis() > 5 {
             debug!(

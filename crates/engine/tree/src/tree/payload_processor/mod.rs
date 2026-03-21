@@ -542,12 +542,18 @@ where
             let _enter = debug_span!(target: "engine::tree::payload_processor", parent: parent_span, "sparse_trie_task")
                 .entered();
 
+            // Mark that a task is in flight so take_or_wait() knows to wait
+            // if the trie isn't available yet (previous task still storing).
+            preserved_sparse_trie.set_task_in_flight();
+
             // Reuse a stored SparseStateTrie if available, applying continuation logic.
             // If this payload's parent state root matches the preserved trie's anchor,
             // we can reuse the pruned trie structure. Otherwise, we clear the trie but
-            // keep allocations.
+            // keep allocations. If a previous task is still running, wait briefly for it
+            // to store the trie rather than starting cold.
             let start = Instant::now();
-            let preserved = preserved_sparse_trie.take();
+            let preserved =
+                preserved_sparse_trie.take_or_wait(std::time::Duration::from_secs(60));
             trie_metrics
                 .sparse_trie_cache_wait_duration_histogram
                 .record(start.elapsed().as_secs_f64());
@@ -634,6 +640,8 @@ where
                 guard.store(PreservedSparseTrie::cleared(trie));
                 deferred
             };
+            // Clear in-flight flag before dropping guard so take_or_wait() stops waiting
+            preserved_sparse_trie.clear_task_in_flight();
             // Drop guard before deferred to release lock before expensive deallocations
             drop(guard);
             drop(deferred);
