@@ -14,6 +14,10 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+/// Shared trie node cache for reducing MDBX reads during multiproof computation.
+pub mod cache;
+pub use cache::SharedTrieNodeCache;
+
 /// The implementation of forward-only in-memory cursor.
 pub mod forward_cursor;
 

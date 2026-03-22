@@ -45,10 +45,11 @@ use reth_provider::{DatabaseProviderROFactory, ProviderError, ProviderResult};
 use reth_storage_errors::db::DatabaseError;
 use reth_tasks::Runtime;
 use reth_trie::{
+    cache::SharedTrieNodeCache,
     hashed_cursor::HashedCursorFactory,
     proof::{ProofBlindedAccountProvider, ProofBlindedStorageProvider},
     proof_v2,
-    trie_cursor::TrieCursorFactory,
+    trie_cursor::{CachingTrieCursorFactory, TrieCursorFactory},
     DecodedMultiProofV2, HashedPostState, Nibbles, ProofTrieNodeV2,
 };
 use reth_trie_sparse::provider::{RevealedNode, TrieNodeProvider, TrieNodeProviderFactory};
@@ -390,12 +391,20 @@ impl ProofWorkerHandle {
 pub struct ProofTaskCtx<Factory> {
     /// The factory for creating state providers.
     factory: Factory,
+    /// Shared trie node cache for reducing MDBX reads during proof computation.
+    trie_cache: Arc<SharedTrieNodeCache>,
 }
 
 impl<Factory> ProofTaskCtx<Factory> {
-    /// Creates a new [`ProofTaskCtx`] with the given factory.
-    pub const fn new(factory: Factory) -> Self {
-        Self { factory }
+    /// Creates a new [`ProofTaskCtx`] with the given factory and no trie node caching.
+    pub fn new(factory: Factory) -> Self {
+        // Zero-capacity cache acts as a no-op: all inserts are skipped, all lookups miss.
+        Self { factory, trie_cache: Arc::new(SharedTrieNodeCache::new(0, 0)) }
+    }
+
+    /// Creates a new [`ProofTaskCtx`] with the given factory and trie node cache.
+    pub fn with_cache(factory: Factory, trie_cache: Arc<SharedTrieNodeCache>) -> Self {
+        Self { factory, trie_cache }
     }
 }
 
@@ -688,9 +697,11 @@ where
     /// If this function panics, the worker thread terminates but other workers
     /// continue operating and the system degrades gracefully.
     fn run(mut self) -> ProviderResult<()> {
-        // Create provider from factory
+        // Create provider from factory, wrapped with caching trie cursors
         let provider = self.task_ctx.factory.database_provider_ro()?;
-        let proof_tx = ProofTaskTx::new(provider, self.worker_id);
+        let caching_provider =
+            CachingTrieCursorFactory::new(provider, self.task_ctx.trie_cache.clone());
+        let proof_tx = ProofTaskTx::new(caching_provider, self.worker_id);
 
         trace!(
             target: "trie::proof_task",
@@ -944,7 +955,10 @@ where
     /// If this function panics, the worker thread terminates but other workers
     /// continue operating and the system degrades gracefully.
     fn run(mut self) -> ProviderResult<()> {
+        // Create provider from factory, wrapped with caching trie cursors
         let provider = self.task_ctx.factory.database_provider_ro()?;
+        let provider =
+            CachingTrieCursorFactory::new(provider, self.task_ctx.trie_cache.clone());
 
         trace!(
             target: "trie::proof_task",
@@ -964,12 +978,14 @@ where
         let storage_trie_cursor = provider.storage_trie_cursor(B256::ZERO)?;
         let storage_hashed_cursor = provider.hashed_storage_cursor(B256::ZERO)?;
 
+        type CachingProvider<P> = CachingTrieCursorFactory<P>;
+
         let mut v2_account_calculator = proof_v2::ProofCalculator::<
             _,
             _,
             AsyncAccountValueEncoder<
-                <Factory::Provider as TrieCursorFactory>::StorageTrieCursor<'_>,
-                <Factory::Provider as HashedCursorFactory>::StorageCursor<'_>,
+                <CachingProvider<Factory::Provider> as TrieCursorFactory>::StorageTrieCursor<'_>,
+                <CachingProvider<Factory::Provider> as HashedCursorFactory>::StorageCursor<'_>,
             >,
         >::new(account_trie_cursor, account_hashed_cursor);
         let v2_storage_calculator =
@@ -993,7 +1009,7 @@ where
 
             match job {
                 AccountWorkerJob::AccountMultiproof { input } => {
-                    let value_encoder_stats = self.process_account_multiproof::<Factory::Provider>(
+                    let value_encoder_stats = self.process_account_multiproof::<CachingTrieCursorFactory<Factory::Provider>>(
                         &mut v2_account_calculator,
                         v2_storage_calculator.clone(),
                         *input,

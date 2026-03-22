@@ -139,6 +139,8 @@ where
     disable_sparse_trie_cache_pruning: bool,
     /// Whether to disable cache metrics recording.
     disable_cache_metrics: bool,
+    /// Shared trie node cache for reducing MDBX reads during multiproof computation.
+    trie_node_cache: Arc<reth_trie::SharedTrieNodeCache>,
 }
 
 impl<N, Evm> PayloadProcessor<Evm>
@@ -173,6 +175,7 @@ where
             sparse_trie_max_storage_tries: config.sparse_trie_max_storage_tries(),
             disable_sparse_trie_cache_pruning: config.disable_sparse_trie_cache_pruning(),
             disable_cache_metrics: config.disable_cache_metrics(),
+            trie_node_cache: Arc::new(reth_trie::SharedTrieNodeCache::new(500_000, 2_000_000)),
         }
     }
 }
@@ -296,7 +299,7 @@ where
         );
 
         // Create and spawn the storage proof task.
-        let task_ctx = ProofTaskCtx::new(multiproof_provider_factory);
+        let task_ctx = ProofTaskCtx::with_cache(multiproof_provider_factory, self.trie_node_cache.clone());
         let halve_workers = transaction_count <= Self::SMALL_BLOCK_PROOF_WORKER_TX_THRESHOLD;
         let proof_handle = ProofWorkerHandle::new(&self.executor, task_ctx, halve_workers);
 
@@ -536,6 +539,7 @@ where
         let max_storage_tries = self.sparse_trie_max_storage_tries;
         let disable_cache_pruning = self.disable_sparse_trie_cache_pruning;
         let executor = self.executor.clone();
+        let trie_node_cache = self.trie_node_cache.clone();
 
         let parent_span = Span::current();
         self.executor.spawn_blocking_named("sparse-trie", move || {
@@ -586,6 +590,13 @@ where
             );
 
             let result = task.run();
+
+            // Apply trie updates to the shared cache for next block's proof workers.
+            // This both inserts updated nodes and removes deleted ones.
+            if let Ok(ref outcome) = result {
+                trie_node_cache.apply_updates(&outcome.trie_updates);
+            }
+
             // Capture the computed state_root before sending the result
             let computed_state_root = result.as_ref().ok().map(|outcome| outcome.state_root);
 
