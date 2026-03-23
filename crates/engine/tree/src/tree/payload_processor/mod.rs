@@ -175,7 +175,7 @@ where
             sparse_trie_max_storage_tries: config.sparse_trie_max_storage_tries(),
             disable_sparse_trie_cache_pruning: config.disable_sparse_trie_cache_pruning(),
             disable_cache_metrics: config.disable_cache_metrics(),
-            trie_node_cache: Arc::new(reth_trie::SharedTrieNodeCache::new(500_000, 2_000_000)),
+            trie_node_cache: Arc::new(reth_trie::SharedTrieNodeCache::new(1_000_000, 20_000_000)),
         }
     }
 }
