@@ -3,11 +3,13 @@
 use alloy_primitives::B256;
 use parking_lot::Mutex;
 use reth_trie_sparse::SparseStateTrie;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
 };
-use std::time::Instant;
 use tracing::debug;
 
 /// Type alias for the sparse trie type used in preservation.
@@ -27,10 +29,7 @@ pub(super) struct SharedPreservedSparseTrie {
 
 impl Default for SharedPreservedSparseTrie {
     fn default() -> Self {
-        Self {
-            trie: Arc::new(Mutex::new(None)),
-            task_in_flight: Arc::new(AtomicBool::new(false)),
-        }
+        Self { trie: Arc::new(Mutex::new(None)), task_in_flight: Arc::new(AtomicBool::new(false)) }
     }
 }
 

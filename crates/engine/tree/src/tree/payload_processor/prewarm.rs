@@ -271,6 +271,23 @@ where
         let hash = env.hash;
 
         if let Some(saved_cache) = saved_cache {
+            if saved_cache.is_local() {
+                // Local (side-chain) cache: never write back to the shared
+                // PayloadExecutionCache. The cache is dropped here; any state mutations
+                // performed during execution vanish with it. We drop `valid_block_rx`
+                // explicitly so the validator-side sender doesn't observe a dangling
+                // receiver — for the local path the validity signal is irrelevant.
+                drop(valid_block_rx);
+                debug!(
+                    target: "engine::caching",
+                    parent_hash=?hash,
+                    "Skipping save_cache for local (side-chain) cache; will be dropped"
+                );
+                drop(saved_cache);
+                metrics.cache_saving_duration.set(start.elapsed().as_secs_f64());
+                return;
+            }
+
             debug!(target: "engine::caching", parent_hash=?hash, "Updating execution cache");
             // Perform all cache operations atomically under the lock
             execution_cache.update_with_guard(|cached| {

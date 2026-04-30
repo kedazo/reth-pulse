@@ -262,11 +262,6 @@ impl CacheStatsHandler {
         let _ = self.size.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Resets size to zero. Called on cache clear.
-    pub(crate) fn reset_size(&self) {
-        self.size.store(0, Ordering::Relaxed);
-    }
-
     /// Resets collision counter to zero (but not size).
     pub(crate) fn reset_stats(&self) {
         self.collisions.store(0, Ordering::Relaxed);
@@ -510,7 +505,6 @@ struct ExecutionCacheInner {
 
     /// Stats handler for the account cache (shared with the cache via [`Stats`]).
     account_stats: Arc<CacheStatsHandler>,
-
 }
 
 impl ExecutionCache {
@@ -699,8 +693,8 @@ impl ExecutionCache {
                     // prior blocks may remain cached, but they won't cause issues because:
                     // - The account itself is removed from account_cache
                     // - EVM checks account existence before reading storage
-                    // - If the account is re-created (CREATE2), the new storage starts
-                    //   fresh and any reads will go through the state provider
+                    // - If the account is re-created (CREATE2), the new storage starts fresh and
+                    //   any reads will go through the state provider
                     for (key, _slot) in &account.storage {
                         self.insert_storage(*addr, (*key).into(), Some(StorageValue::ZERO));
                     }
@@ -729,18 +723,6 @@ impl ExecutionCache {
         }
 
         Ok(())
-    }
-
-    /// Clears storage and account caches, resetting them to empty state.
-    ///
-    /// We do not clear the bytecodes cache, because its mapping can never change, as it's
-    /// `keccak256(bytecode) => bytecode`.
-    pub(crate) fn clear(&self) {
-        self.0.storage_cache.clear();
-        self.0.account_cache.clear();
-
-        self.0.storage_stats.reset_size();
-        self.0.account_stats.reset_size();
     }
 
     /// Updates the provided metrics with the current stats from the cache's stats handlers,
@@ -782,12 +764,25 @@ pub struct SavedCache {
 
     /// Whether to skip cache metrics recording (can be expensive with large cached state).
     disable_cache_metrics: bool,
+
+    /// When true, this cache is locally owned by a single side-chain payload execution
+    /// and must never be written back to the shared `PayloadExecutionCache`. Mutations to
+    /// a local cache vanish when this `SavedCache` is dropped, preventing pollution of the
+    /// canonical cache by failed/aborted side-chain executions.
+    is_local: bool,
 }
 
 impl SavedCache {
     /// Creates a new instance with the internals
     pub fn new(hash: B256, caches: ExecutionCache, metrics: CachedStateMetrics) -> Self {
-        Self { hash, caches, metrics, usage_guard: Arc::new(()), disable_cache_metrics: false }
+        Self {
+            hash,
+            caches,
+            metrics,
+            usage_guard: Arc::new(()),
+            disable_cache_metrics: false,
+            is_local: false,
+        }
     }
 
     /// Sets whether to disable cache metrics recording.
@@ -796,9 +791,22 @@ impl SavedCache {
         self
     }
 
+    /// Marks this cache as local-only — `save_cache` will not write it back to the shared
+    /// `PayloadExecutionCache`. Used for side-chain (orphan) payloads.
+    pub const fn with_is_local(mut self, is_local: bool) -> Self {
+        self.is_local = is_local;
+        self
+    }
+
     /// Returns the hash for this cache
     pub const fn executed_block_hash(&self) -> B256 {
         self.hash
+    }
+
+    /// Returns true if this cache is local-only and must not be written back to the shared
+    /// `PayloadExecutionCache`.
+    pub const fn is_local(&self) -> bool {
+        self.is_local
     }
 
     /// Splits the cache into its caches, metrics, and `disable_cache_metrics` flag, consuming it.
@@ -835,11 +843,6 @@ impl SavedCache {
             return
         }
         self.caches.update_metrics(&self.metrics);
-    }
-
-    /// Clears all caches, resetting them to empty state.
-    pub(crate) fn clear(&self) {
-        self.caches.clear();
     }
 }
 

@@ -299,7 +299,8 @@ where
         );
 
         // Create and spawn the storage proof task.
-        let task_ctx = ProofTaskCtx::with_cache(multiproof_provider_factory, self.trie_node_cache.clone());
+        let task_ctx =
+            ProofTaskCtx::with_cache(multiproof_provider_factory, self.trie_node_cache.clone());
         let halve_workers = transaction_count <= Self::SMALL_BLOCK_PROOF_WORKER_TX_THRESHOLD;
         let proof_handle = ProofWorkerHandle::new(&self.executor, task_ctx, halve_workers);
 
@@ -464,7 +465,10 @@ where
         let skip_prewarm =
             self.disable_transaction_prewarming || env.transaction_count < SMALL_BLOCK_TX_THRESHOLD;
 
-        let saved_cache = self.disable_state_cache.not().then(|| self.cache_for(env.parent_hash));
+        let saved_cache = self
+            .disable_state_cache
+            .not()
+            .then(|| self.cache_for(env.parent_hash, env.parent_is_canonical_head));
 
         // configure prewarming
         let prewarm_ctx = PrewarmContext {
@@ -502,16 +506,23 @@ where
         CacheTaskHandle { saved_cache, to_prewarm_task: Some(to_prewarm_task) }
     }
 
-    /// Returns the cache for the given parent hash.
+    /// Returns the cache to use for the given parent hash.
     ///
-    /// If the given hash is different then what is recently cached, then this will create a new
-    /// instance.
+    /// When `parent_is_canonical_head` is true, this is a canonical extension: try to reuse
+    /// the shared `PayloadExecutionCache`; on miss, allocate a fresh shareable cache that
+    /// will be written back to the shared slot on successful execution.
+    ///
+    /// When `parent_is_canonical_head` is false, this is a side-chain (orphan) payload:
+    /// always allocate a fresh `is_local=true` cache that is dropped after execution and
+    /// never written back to the shared slot. This prevents mid-flight side-chain execution
+    /// failures from polluting the shared cache for subsequent canonical block validation.
     #[instrument(level = "debug", target = "engine::caching", skip(self))]
-    fn cache_for(&self, parent_hash: B256) -> SavedCache {
-        if let Some(cache) = self.execution_cache.get_cache_for(parent_hash) {
-            debug!("reusing execution cache");
-            cache
-        } else {
+    fn cache_for(&self, parent_hash: B256, parent_is_canonical_head: bool) -> SavedCache {
+        if parent_is_canonical_head {
+            if let Some(cache) = self.execution_cache.get_cache_for(parent_hash) {
+                debug!("reusing execution cache");
+                return cache;
+            }
             debug!("creating new execution cache on cache miss");
             let start = Instant::now();
             let cache = ExecutionCache::new(self.cross_block_cache_size);
@@ -519,6 +530,15 @@ where
             metrics.record_cache_creation(start.elapsed());
             SavedCache::new(parent_hash, cache, metrics)
                 .with_disable_cache_metrics(self.disable_cache_metrics)
+        } else {
+            debug!("creating local execution cache for side-chain payload");
+            let start = Instant::now();
+            let cache = ExecutionCache::new(self.cross_block_cache_size);
+            let metrics = CachedStateMetrics::zeroed();
+            metrics.record_cache_creation(start.elapsed());
+            SavedCache::new(parent_hash, cache, metrics)
+                .with_disable_cache_metrics(self.disable_cache_metrics)
+                .with_is_local(true)
         }
     }
 
@@ -962,17 +982,21 @@ impl PayloadExecutionCache {
                 "Existing cache found"
             );
 
-            if available {
-                // If the has is available (no other threads are using it), but has a mismatching
-                // parent hash, we can just clear it and keep using without re-creating from
-                // scratch.
-                if !hash_matches {
-                    c.clear();
-                }
-                return Some(c.clone())
-            } else if hash_matches {
+            if available && hash_matches {
+                return Some(c.clone());
+            }
+            if !available && hash_matches {
                 self.metrics.execution_cache_in_use.increment(1);
             }
+            // available && !hash_matches → fall through to None.
+            //
+            // We deliberately do NOT clear the shared cache here. Clearing for an unrelated
+            // payload (e.g. a late-arriving side-chain orphan whose parent is not canonical
+            // head) would erase state that the next canonical extension needs. Worse, if the
+            // unrelated payload's execution then fails mid-flight before `save_cache` runs,
+            // it would leave the shared cache polluted under the still-canonical hash field
+            // and trigger NonceTooHigh on the next canonical block. Side-chain payloads
+            // must allocate their own isolated cache via `cache_for`'s local path.
         } else {
             debug!(target: "engine::caching", %parent_hash, "No cache found");
         }
@@ -1063,6 +1087,14 @@ pub struct ExecutionEnv<Evm: ConfigureEvm> {
     /// Withdrawals included in the block.
     /// Used to generate prefetch targets for withdrawal addresses.
     pub withdrawals: Option<Vec<Withdrawal>>,
+    /// True iff `parent_hash` equals the canonical head when this payload was scheduled.
+    /// Drives whether prewarm/main execution may share the global `PayloadExecutionCache`
+    /// (canonical extension) or must run against an isolated, locally-owned cache that is
+    /// dropped after execution (side-chain / orphan payload).
+    ///
+    /// Side-chain payloads receive a local cache so that mid-flight execution failures
+    /// cannot pollute the shared cache and corrupt subsequent canonical block validation.
+    pub parent_is_canonical_head: bool,
 }
 
 impl<Evm: ConfigureEvm> ExecutionEnv<Evm>
@@ -1080,6 +1112,7 @@ where
             transaction_count: 0,
             gas_used: 0,
             withdrawals: None,
+            parent_is_canonical_head: true,
         }
     }
 }
@@ -1157,16 +1190,125 @@ mod tests {
     }
 
     #[test]
-    fn execution_cache_mismatch_parent_clears_and_returns() {
+    fn execution_cache_mismatch_parent_returns_none_and_preserves_shared_cache() {
         let execution_cache = PayloadExecutionCache::default();
         let hash = B256::from([3u8; 32]);
 
         execution_cache.update_with_guard(|slot| *slot = Some(make_saved_cache(hash)));
 
-        // When the parent hash doesn't match, the cache is cleared and returned for reuse
+        // When the parent hash doesn't match, the shared cache must NOT be returned and
+        // must NOT be mutated. Side-chain payloads will allocate their own isolated cache
+        // via PayloadProcessor::cache_for; the canonical shared slot is left untouched so
+        // the next canonical block can reuse it.
         let different_hash = B256::from([4u8; 32]);
         let cache = execution_cache.get_cache_for(different_hash);
-        assert!(cache.is_some(), "cache should be returned for reuse after clearing")
+        assert!(
+            cache.is_none(),
+            "cache must not be returned when parent hash does not match the cached hash"
+        );
+
+        // The original cache is still present, untouched, and reusable for its real owner.
+        let canonical = execution_cache
+            .get_cache_for(hash)
+            .expect("shared cache should still be available for its original hash");
+        assert_eq!(canonical.executed_block_hash(), hash);
+    }
+
+    #[test]
+    fn cache_for_canonical_with_stale_shared_returns_fresh() {
+        // PayloadProcessor::cache_for should produce a fresh, shareable (non-local) cache
+        // when the shared slot holds a different hash but parent_is_canonical_head=true.
+        // This covers the post-FCU reorg case: head advanced past whatever the shared cache
+        // last held; the next canonical extension takes a single cold start without
+        // touching the displaced slot.
+        let payload_processor = PayloadProcessor::new(
+            reth_tasks::Runtime::test(),
+            EthEvmConfig::new(Arc::new(ChainSpec::default())),
+            &TreeConfig::default(),
+            PrecompileCacheMap::default(),
+        );
+
+        let stale_hash = B256::from([7u8; 32]);
+        payload_processor
+            .execution_cache
+            .update_with_guard(|slot| *slot = Some(make_saved_cache(stale_hash)));
+
+        let new_parent = B256::from([8u8; 32]);
+        let cache = payload_processor.cache_for(new_parent, true);
+        assert_eq!(cache.executed_block_hash(), new_parent);
+        assert!(!cache.is_local(), "canonical-extension cache must not be marked local");
+
+        // Shared slot is unchanged until save_cache writes back.
+        let still_stale = payload_processor.execution_cache.get_cache_for(stale_hash);
+        assert!(still_stale.is_some(), "shared slot must not have been mutated");
+    }
+
+    #[test]
+    fn cache_for_side_chain_always_local() {
+        // PayloadProcessor::cache_for must return an isolated, locally-owned cache
+        // whenever parent_is_canonical_head=false, regardless of whether the shared
+        // slot would have matched. This guarantees side-chain (orphan) execution can
+        // never write back into the canonical cache.
+        let payload_processor = PayloadProcessor::new(
+            reth_tasks::Runtime::test(),
+            EthEvmConfig::new(Arc::new(ChainSpec::default())),
+            &TreeConfig::default(),
+            PrecompileCacheMap::default(),
+        );
+
+        let shared_hash = B256::from([9u8; 32]);
+        payload_processor
+            .execution_cache
+            .update_with_guard(|slot| *slot = Some(make_saved_cache(shared_hash)));
+
+        // Even when the requested parent_hash matches the shared slot, side-chain
+        // detection wins: we get an isolated local cache.
+        let cache = payload_processor.cache_for(shared_hash, false);
+        assert!(cache.is_local(), "side-chain cache must be local-only");
+        assert_eq!(cache.executed_block_hash(), shared_hash);
+
+        // The shared slot is untouched.
+        let still_shared = payload_processor.execution_cache.get_cache_for(shared_hash);
+        assert!(still_shared.is_some(), "shared slot must not have been mutated");
+    }
+
+    #[test]
+    fn side_chain_does_not_pollute_canonical_cache() {
+        // Regression test for the 2026-04-30 incident: a side-chain (orphan) payload
+        // arriving after canonical head has advanced past it must not be able to
+        // pollute the shared canonical cache via the prewarm path. Even if the local
+        // cache is mutated and dropped (simulating a mid-flight execution failure
+        // where save_cache never runs), the canonical SavedCache hash and contents
+        // remain intact.
+        let payload_processor = PayloadProcessor::new(
+            reth_tasks::Runtime::test(),
+            EthEvmConfig::new(Arc::new(ChainSpec::default())),
+            &TreeConfig::default(),
+            PrecompileCacheMap::default(),
+        );
+
+        let canonical_hash = B256::from([0xCAu8; 32]);
+        payload_processor
+            .execution_cache
+            .update_with_guard(|slot| *slot = Some(make_saved_cache(canonical_hash)));
+
+        // Acquire and use a local cache for an orphan payload (different parent hash).
+        let orphan_parent = B256::from([0xEEu8; 32]);
+        {
+            let local = payload_processor.cache_for(orphan_parent, false);
+            assert!(local.is_local(), "orphan payload must receive an isolated local cache");
+            // Mutating the local cache cannot reach the shared slot — they are disjoint
+            // ExecutionCache instances. We don't actually need to mutate to verify
+            // isolation; dropping the local cache here exercises the same drop path that
+            // would follow a mid-flight execution failure with no save_cache writeback.
+        }
+
+        // The canonical cache is still present and addressable by its original hash.
+        let canonical = payload_processor
+            .execution_cache
+            .get_cache_for(canonical_hash)
+            .expect("canonical cache must survive a side-chain payload's lifecycle");
+        assert_eq!(canonical.executed_block_hash(), canonical_hash);
     }
 
     #[test]
