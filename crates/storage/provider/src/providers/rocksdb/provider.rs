@@ -8,6 +8,7 @@ use alloy_primitives::{
 use itertools::Itertools;
 use metrics::Label;
 use parking_lot::Mutex;
+use rayon::prelude::*;
 use reth_chain_state::ExecutedBlock;
 use reth_db_api::{
     database_metrics::DatabaseMetrics,
@@ -27,8 +28,8 @@ use reth_storage_errors::{
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, CompactionPri, DBCompressionType,
     DBRawIteratorWithThreadMode, IteratorMode, OptimisticTransactionDB,
-    OptimisticTransactionOptions, Options, Transaction, WriteBatchWithTransaction, WriteOptions,
-    DB,
+    OptimisticTransactionOptions, Options, SnapshotWithThreadMode, Transaction,
+    WriteBatchWithTransaction, WriteBufferManager, WriteOptions, DB, DEFAULT_COLUMN_FAMILY_NAME,
 };
 use std::{
     collections::BTreeMap,
@@ -37,6 +38,13 @@ use std::{
     sync::Arc,
 };
 use tracing::instrument;
+
+/// Returns [`WriteOptions`] with WAL sync enabled for crash durability.
+fn synced_write_options() -> WriteOptions {
+    let mut opts = WriteOptions::default();
+    opts.set_sync(true);
+    opts
+}
 
 /// Pending `RocksDB` batches type alias.
 pub(crate) type PendingRocksDBBatches = Arc<Mutex<Vec<WriteBatchWithTransaction<true>>>>;
@@ -126,17 +134,32 @@ const DEFAULT_BYTES_PER_SYNC: u64 = 1_048_576;
 /// to 64 MB default, with negligible impact on mean throughput.
 const DEFAULT_WRITE_BUFFER_SIZE: usize = 128 << 20;
 
+/// Default total `RocksDB` memtable memory budget across column families (4 GiB).
+///
+/// This is a soft limit; with write stalls enabled, `RocksDB` waits for flushes once
+/// memtable arena usage exceeds the budget.
+const DEFAULT_WRITE_BUFFER_MANAGER_SIZE: usize = 4 * 1024 * 1024 * 1024;
+
 /// Default buffer capacity for compression in batches.
 /// 4 KiB matches common block/page sizes and comfortably holds typical history values,
 /// reducing the first few reallocations without over-allocating.
 const DEFAULT_COMPRESS_BUF_CAPACITY: usize = 4096;
 
-/// Default auto-commit threshold for batch writes (4 GiB).
+/// Default auto-commit threshold for batch writes (512 MiB).
 ///
 /// When a batch exceeds this size, it is automatically committed to prevent OOM
-/// during large bulk writes. The consistency check on startup heals any crash
-/// that occurs between auto-commits.
-const DEFAULT_AUTO_COMMIT_THRESHOLD: usize = 4 * 1024 * 1024 * 1024;
+/// during large bulk writes. Keep this below the `RocksDB` write buffer manager
+/// budget so stalls can recover without waiting on a single large flush.
+/// The consistency check on startup heals any crash that occurs between auto-commits.
+const DEFAULT_AUTO_COMMIT_THRESHOLD: usize = 512 * 1024 * 1024;
+
+/// Minimum BAL value size stored in `BlobDB` files.
+///
+/// Smaller BALs stay inline. Larger payloads avoid regular LSM value compaction.
+const DEFAULT_BAL_MIN_BLOB_SIZE: u64 = 4 * 1024;
+
+/// Target BAL blob file size.
+const DEFAULT_BAL_BLOB_FILE_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Builder for [`RocksDBProvider`].
 pub struct RocksDBBuilder {
@@ -200,6 +223,9 @@ impl RocksDBBuilder {
         options.create_missing_column_families(true);
         options.set_max_background_jobs(DEFAULT_MAX_BACKGROUND_JOBS);
         options.set_bytes_per_sync(DEFAULT_BYTES_PER_SYNC);
+        let write_buffer_manager =
+            WriteBufferManager::new_write_buffer_manager(DEFAULT_WRITE_BUFFER_MANAGER_SIZE, true);
+        options.set_write_buffer_manager(&write_buffer_manager);
 
         options.set_bottommost_compression_type(DBCompressionType::Zstd);
         options.set_bottommost_zstd_max_train_bytes(0, true);
@@ -238,6 +264,16 @@ impl RocksDBBuilder {
         cf_options.set_bottommost_zstd_max_train_bytes(0, true);
         cf_options.set_write_buffer_size(DEFAULT_WRITE_BUFFER_SIZE);
 
+        cf_options
+    }
+
+    /// Creates column family options for block access list payloads.
+    fn block_access_lists_column_family_options(cache: &Cache) -> Options {
+        let mut cf_options = Self::default_column_family_options(cache);
+        cf_options.set_enable_blob_files(true);
+        cf_options.set_min_blob_size(DEFAULT_BAL_MIN_BLOB_SIZE);
+        cf_options.set_blob_file_size(DEFAULT_BAL_BLOB_FILE_SIZE);
+        cf_options.set_blob_compression_type(DBCompressionType::Lz4);
         cf_options
     }
 
@@ -313,6 +349,10 @@ impl RocksDBBuilder {
 
     /// Sets read-only mode.
     ///
+    /// Opens the database as a secondary instance, which supports catching up
+    /// with the primary via [`RocksDBProvider::try_catch_up_with_primary`].
+    /// A temporary directory is created automatically for the secondary's LOG files.
+    ///
     /// Note: Write operations on a read-only provider will panic at runtime.
     pub const fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
@@ -324,12 +364,14 @@ impl RocksDBBuilder {
         let options =
             Self::default_options(self.log_level, &self.block_cache, self.enable_statistics);
 
-        let cf_descriptors: Vec<ColumnFamilyDescriptor> = self
+        let mut cf_descriptors: Vec<ColumnFamilyDescriptor> = self
             .column_families
             .iter()
             .map(|name| {
                 let cf_options = if name == tables::TransactionHashNumbers::NAME {
                     Self::tx_hash_numbers_column_family_options(&self.block_cache)
+                } else if name == tables::BlockAccessLists::NAME {
+                    Self::block_access_lists_column_family_options(&self.block_cache)
                 } else {
                     Self::default_column_family_options(&self.block_cache)
                 };
@@ -337,17 +379,68 @@ impl RocksDBBuilder {
             })
             .collect();
 
+        // RocksDB requires every existing column family to be opened. Preserve column families
+        // unknown to this configuration so databases remain openable after a downgrade.
+        if RocksDBProvider::exists(&self.path) {
+            let existing_column_families = DB::list_cf(&options, &self.path).map_err(|e| {
+                ProviderError::Database(DatabaseError::Open(DatabaseErrorInfo {
+                    message: e.to_string().into(),
+                    code: -1,
+                }))
+            })?;
+            let unknown_column_families: Vec<String> = existing_column_families
+                .into_iter()
+                .filter(|name| {
+                    name != DEFAULT_COLUMN_FAMILY_NAME && !self.column_families.contains(name)
+                })
+                .collect();
+            if !unknown_column_families.is_empty() {
+                tracing::debug!(
+                    target: "providers::rocksdb",
+                    column_families = ?unknown_column_families,
+                    "Preserving unknown column families"
+                );
+                cf_descriptors.extend(unknown_column_families.into_iter().map(|name| {
+                    ColumnFamilyDescriptor::new(
+                        name,
+                        Self::default_column_family_options(&self.block_cache),
+                    )
+                }));
+            }
+        }
+
         let metrics = self.enable_metrics.then(RocksDBMetrics::default);
 
         if self.read_only {
-            let db = DB::open_cf_descriptors_read_only(&options, &self.path, cf_descriptors, false)
-                .map_err(|e| {
-                    ProviderError::Database(DatabaseError::Open(DatabaseErrorInfo {
-                        message: e.to_string().into(),
-                        code: -1,
-                    }))
-                })?;
-            Ok(RocksDBProvider(Arc::new(RocksDBProviderInner::ReadOnly { db, metrics })))
+            // Open as secondary instance for catch-up capability.
+            // Secondary needs max_open_files = -1 to keep all FDs open.
+            let mut options = options;
+            options.set_max_open_files(-1);
+
+            let secondary_path = self
+                .path
+                .parent()
+                .unwrap_or(&self.path)
+                .join(format!("rocksdb-secondary-tmp-{}", std::process::id()));
+            reth_fs_util::create_dir_all(&secondary_path).map_err(ProviderError::other)?;
+
+            let db = DB::open_cf_descriptors_as_secondary(
+                &options,
+                &self.path,
+                &secondary_path,
+                cf_descriptors,
+            )
+            .map_err(|e| {
+                ProviderError::Database(DatabaseError::Open(DatabaseErrorInfo {
+                    message: e.to_string().into(),
+                    code: -1,
+                }))
+            })?;
+            Ok(RocksDBProvider(Arc::new(RocksDBProviderInner::Secondary {
+                db,
+                metrics,
+                secondary_path,
+            })))
         } else {
             // Use OptimisticTransactionDB for MDBX-like transaction semantics (read-your-writes,
             // rollback) OptimisticTransactionDB uses optimistic concurrency control (conflict
@@ -393,13 +486,16 @@ enum RocksDBProviderInner {
         /// Metrics latency & operations.
         metrics: Option<RocksDBMetrics>,
     },
-    /// Read-only mode using `DB` opened with `open_cf_descriptors_read_only`.
-    /// This doesn't acquire an exclusive lock, allowing concurrent reads.
-    ReadOnly {
-        /// Read-only `RocksDB` database instance.
+    /// Secondary mode using `DB` opened with `open_cf_descriptors_as_secondary`.
+    /// Supports catching up with the primary via `try_catch_up_with_primary`.
+    /// Does not support snapshots; consistency is guaranteed externally.
+    Secondary {
+        /// Secondary `RocksDB` database instance.
         db: DB,
         /// Metrics latency & operations.
         metrics: Option<RocksDBMetrics>,
+        /// Temporary directory for secondary LOG files, removed on drop.
+        secondary_path: PathBuf,
     },
 }
 
@@ -407,7 +503,7 @@ impl RocksDBProviderInner {
     /// Returns the metrics for this provider.
     const fn metrics(&self) -> Option<&RocksDBMetrics> {
         match self {
-            Self::ReadWrite { metrics, .. } | Self::ReadOnly { metrics, .. } => metrics.as_ref(),
+            Self::ReadWrite { metrics, .. } | Self::Secondary { metrics, .. } => metrics.as_ref(),
         }
     }
 
@@ -415,8 +511,8 @@ impl RocksDBProviderInner {
     fn db_rw(&self) -> &OptimisticTransactionDB {
         match self {
             Self::ReadWrite { db, .. } => db,
-            Self::ReadOnly { .. } => {
-                panic!("Cannot perform write operation on read-only RocksDB provider")
+            Self::Secondary { .. } => {
+                panic!("Cannot perform write operation on secondary RocksDB provider")
             }
         }
     }
@@ -425,19 +521,9 @@ impl RocksDBProviderInner {
     fn cf_handle<T: Table>(&self) -> Result<&rocksdb::ColumnFamily, DatabaseError> {
         let cf = match self {
             Self::ReadWrite { db, .. } => db.cf_handle(T::NAME),
-            Self::ReadOnly { db, .. } => db.cf_handle(T::NAME),
+            Self::Secondary { db, .. } => db.cf_handle(T::NAME),
         };
         cf.ok_or_else(|| DatabaseError::Other(format!("Column family '{}' not found", T::NAME)))
-    }
-
-    /// Gets the column family handle for a table from the read-write database.
-    ///
-    /// # Panics
-    /// Panics if in read-only mode.
-    fn cf_handle_rw(&self, name: &str) -> Result<&rocksdb::ColumnFamily, DatabaseError> {
-        self.db_rw()
-            .cf_handle(name)
-            .ok_or_else(|| DatabaseError::Other(format!("Column family '{}' not found", name)))
     }
 
     /// Gets a value from a column family.
@@ -448,7 +534,7 @@ impl RocksDBProviderInner {
     ) -> Result<Option<Vec<u8>>, rocksdb::Error> {
         match self {
             Self::ReadWrite { db, .. } => db.get_cf(cf, key),
-            Self::ReadOnly { db, .. } => db.get_cf(cf, key),
+            Self::Secondary { db, .. } => db.get_cf(cf, key),
         }
     }
 
@@ -489,7 +575,7 @@ impl RocksDBProviderInner {
     ) -> RocksDBIterEnum<'_> {
         match self {
             Self::ReadWrite { db, .. } => RocksDBIterEnum::ReadWrite(db.iterator_cf(cf, mode)),
-            Self::ReadOnly { db, .. } => RocksDBIterEnum::ReadOnly(db.iterator_cf(cf, mode)),
+            Self::Secondary { db, .. } => RocksDBIterEnum::ReadOnly(db.iterator_cf(cf, mode)),
         }
     }
 
@@ -500,7 +586,15 @@ impl RocksDBProviderInner {
     fn raw_iterator_cf(&self, cf: &rocksdb::ColumnFamily) -> RocksDBRawIterEnum<'_> {
         match self {
             Self::ReadWrite { db, .. } => RocksDBRawIterEnum::ReadWrite(db.raw_iterator_cf(cf)),
-            Self::ReadOnly { db, .. } => RocksDBRawIterEnum::ReadOnly(db.raw_iterator_cf(cf)),
+            Self::Secondary { db, .. } => RocksDBRawIterEnum::ReadOnly(db.raw_iterator_cf(cf)),
+        }
+    }
+
+    /// Returns a read-only, point-in-time snapshot of the database.
+    fn snapshot(&self) -> RocksReadSnapshotInner<'_> {
+        match self {
+            Self::ReadWrite { db, .. } => RocksReadSnapshotInner::ReadWrite(db.snapshot()),
+            Self::Secondary { db, .. } => RocksReadSnapshotInner::Secondary(db),
         }
     }
 
@@ -508,7 +602,7 @@ impl RocksDBProviderInner {
     fn path(&self) -> &Path {
         match self {
             Self::ReadWrite { db, .. } => db.path(),
-            Self::ReadOnly { db, .. } => db.path(),
+            Self::Secondary { db, .. } => db.path(),
         }
     }
 
@@ -582,7 +676,7 @@ impl RocksDBProviderInner {
 
         match self {
             Self::ReadWrite { db, .. } => collect_stats!(db),
-            Self::ReadOnly { db, .. } => collect_stats!(db),
+            Self::Secondary { db, .. } => collect_stats!(db),
         }
 
         stats
@@ -602,9 +696,9 @@ impl fmt::Debug for RocksDBProviderInner {
                 .field("db", &"<OptimisticTransactionDB>")
                 .field("metrics", metrics)
                 .finish(),
-            Self::ReadOnly { metrics, .. } => f
-                .debug_struct("RocksDBProviderInner::ReadOnly")
-                .field("db", &"<DB (read-only)>")
+            Self::Secondary { metrics, .. } => f
+                .debug_struct("RocksDBProviderInner::Secondary")
+                .field("db", &"<DB (secondary)>")
                 .field("metrics", metrics)
                 .finish(),
         }
@@ -629,7 +723,10 @@ impl Drop for RocksDBProviderInner {
                 }
                 db.cancel_all_background_work(true);
             }
-            Self::ReadOnly { db, .. } => db.cancel_all_background_work(true),
+            Self::Secondary { db, secondary_path, .. } => {
+                db.cancel_all_background_work(true);
+                let _ = std::fs::remove_dir_all(secondary_path);
+            }
         }
     }
 }
@@ -700,7 +797,32 @@ impl RocksDBProvider {
 
     /// Returns `true` if this provider is in read-only mode.
     pub fn is_read_only(&self) -> bool {
-        matches!(self.0.as_ref(), RocksDBProviderInner::ReadOnly { .. })
+        matches!(self.0.as_ref(), RocksDBProviderInner::Secondary { .. })
+    }
+
+    /// Tries to catch up with the primary instance by reading new WAL and MANIFEST entries.
+    ///
+    /// This is a no-op for read-write and read-only providers.
+    /// For secondary providers, this incrementally syncs with the primary's latest state.
+    pub fn try_catch_up_with_primary(&self) -> ProviderResult<()> {
+        match self.0.as_ref() {
+            RocksDBProviderInner::Secondary { db, .. } => {
+                db.try_catch_up_with_primary().map_err(|e| {
+                    ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
+                        message: e.to_string().into(),
+                        code: -1,
+                    }))
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Returns a read-only, point-in-time snapshot of the database.
+    ///
+    /// Lighter weight than [`RocksTx`] — no write-conflict tracking, and `Send + Sync`.
+    pub fn snapshot(&self) -> RocksReadSnapshot<'_> {
+        RocksReadSnapshot { inner: self.0.snapshot(), provider: self }
     }
 
     /// Creates a new transaction with MDBX-like semantics (read-your-writes, rollback).
@@ -711,7 +833,7 @@ impl RocksDBProvider {
     /// # Panics
     /// Panics if the provider is in read-only mode.
     pub fn tx(&self) -> RocksTx<'_> {
-        let write_options = WriteOptions::default();
+        let write_options = synced_write_options();
         let txn_options = OptimisticTransactionOptions::default();
         let inner = self.0.db_rw().transaction_opt(&write_options, &txn_options);
         RocksTx { inner, provider: self }
@@ -788,6 +910,19 @@ impl RocksDBProvider {
             })?;
 
             Ok(result.and_then(|value| T::Value::decompress(&value).ok()))
+        })
+    }
+
+    /// Gets raw bytes from the specified table without decompressing.
+    pub fn get_raw<T: Table>(&self, key: T::Key) -> ProviderResult<Option<Vec<u8>>> {
+        let encoded = key.encode();
+        self.execute_with_operation_metric(RocksDBOperation::Get, T::NAME, |this| {
+            this.0.get_cf(this.get_cf_handle::<T>()?, encoded.as_ref()).map_err(|e| {
+                ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
+                    message: e.to_string().into(),
+                    code: -1,
+                }))
+            })
         })
     }
 
@@ -909,6 +1044,18 @@ impl RocksDBProvider {
         Ok(RocksDBIter { inner: iter, _marker: std::marker::PhantomData })
     }
 
+    /// Creates an iterator starting from the given key (inclusive, seek forward).
+    ///
+    /// Returns decoded `(Key, Value)` pairs starting from the first key >= `key`.
+    pub fn iter_from<T: Table>(&self, key: T::Key) -> ProviderResult<RocksDBIter<'_, T>> {
+        let cf = self.get_cf_handle::<T>()?;
+        let encoded_key = key.encode();
+        let iter = self
+            .0
+            .iterator_cf(cf, IteratorMode::From(encoded_key.as_ref(), rocksdb::Direction::Forward));
+        Ok(RocksDBIter { inner: iter, _marker: std::marker::PhantomData })
+    }
+
     /// Returns statistics for all column families in the database.
     ///
     /// Returns a vector of (`table_name`, `estimated_keys`, `estimated_size_bytes`) tuples.
@@ -1004,6 +1151,18 @@ impl RocksDBProvider {
         let cf = self.get_cf_handle::<T>()?;
         let iter = self.0.iterator_cf(cf, IteratorMode::Start);
         Ok(RocksDBRawIter { inner: iter })
+    }
+
+    /// Creates a raw key iterator positioned at `key`.
+    pub(crate) fn raw_key_iter_from<T: Table>(
+        &self,
+        key: T::Key,
+    ) -> ProviderResult<RocksDBRawKeyIter<'_>> {
+        let cf = self.get_cf_handle::<T>()?;
+        let encoded_key = key.encode();
+        let mut iter = self.0.raw_iterator_cf(cf);
+        iter.seek(encoded_key.as_ref());
+        Ok(RocksDBRawKeyIter { inner: iter })
     }
 
     /// Returns all account history shards for the given address in ascending key order.
@@ -1189,7 +1348,7 @@ impl RocksDBProvider {
     /// Panics if the provider is in read-only mode.
     #[instrument(level = "debug", target = "providers::rocksdb", skip_all, fields(batch_len = batch.len(), batch_size = batch.size_in_bytes()))]
     pub fn commit_batch(&self, batch: WriteBatchWithTransaction<true>) -> ProviderResult<()> {
-        self.0.db_rw().write_opt(batch, &WriteOptions::default()).map_err(|e| {
+        self.0.db_rw().write_opt(batch, &synced_write_options()).map_err(|e| {
             ProviderError::Database(DatabaseError::Commit(DatabaseErrorInfo {
                 message: e.to_string().into(),
                 code: -1,
@@ -1285,10 +1444,8 @@ impl RocksDBProvider {
         let mut batch = self.batch();
         for (block, &first_tx_num) in blocks.iter().zip(tx_nums) {
             let body = block.recovered_block().body();
-            let mut tx_num = first_tx_num;
-            for transaction in body.transactions_iter() {
+            for (tx_num, transaction) in (first_tx_num..).zip(body.transactions_iter()) {
                 batch.put::<tables::TransactionHashNumbers>(*transaction.tx_hash(), &tx_num)?;
-                tx_num += 1;
             }
         }
         ctx.pending_batches.lock().push(batch.into_inner());
@@ -1337,7 +1494,6 @@ impl RocksDBProvider {
         blocks: &[ExecutedBlock<N>],
         ctx: &RocksDBWriteCtx,
     ) -> ProviderResult<()> {
-        let mut batch = self.batch();
         let mut storage_history: BTreeMap<(Address, B256), Vec<u64>> = BTreeMap::new();
 
         for (block_idx, block) in blocks.iter().enumerate() {
@@ -1359,12 +1515,273 @@ impl RocksDBProvider {
             }
         }
 
-        // Write storage history using proper shard append logic
-        for ((address, slot), indices) in storage_history {
-            batch.append_storage_history_shard(address, slot, indices)?;
+        let shard_puts = storage_history
+            .into_par_iter()
+            .map(|((address, slot), indices)| {
+                self.storage_history_shards_to_put(address, slot, indices)
+            })
+            .collect::<ProviderResult<Vec<_>>>()?;
+
+        let mut batch = self.batch();
+        for shards in shard_puts {
+            for (key, shard) in shards {
+                batch.put::<tables::StoragesHistory>(key, &shard)?;
+            }
         }
         ctx.pending_batches.lock().push(batch.into_inner());
         Ok(())
+    }
+
+    /// Prepares storage history shard writes by reading the current last shard and appending
+    /// indices.
+    fn storage_history_shards_to_put(
+        &self,
+        address: Address,
+        storage_key: B256,
+        indices: Vec<u64>,
+    ) -> ProviderResult<Vec<(StorageShardedKey, BlockNumberList)>> {
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        debug_assert!(
+            indices.windows(2).all(|w| w[0] < w[1]),
+            "indices must be strictly increasing: {:?}",
+            indices
+        );
+
+        let last_key = StorageShardedKey::last(address, storage_key);
+        let last_shard_opt = self.get::<tables::StoragesHistory>(last_key.clone())?;
+        let mut last_shard = last_shard_opt.unwrap_or_else(BlockNumberList::empty);
+
+        last_shard.append(indices).map_err(ProviderError::other)?;
+
+        if last_shard.len() <= NUM_OF_INDICES_IN_SHARD as u64 {
+            return Ok(vec![(last_key, last_shard)]);
+        }
+
+        let chunks = last_shard.iter().chunks(NUM_OF_INDICES_IN_SHARD);
+        let mut chunks_peekable = chunks.into_iter().peekable();
+        let mut shards = Vec::new();
+
+        while let Some(chunk) = chunks_peekable.next() {
+            let shard = BlockNumberList::new_pre_sorted(chunk);
+            let highest_block_number = if chunks_peekable.peek().is_some() {
+                shard.iter().next_back().expect("`chunks` does not return empty list")
+            } else {
+                u64::MAX
+            };
+
+            shards
+                .push((StorageShardedKey::new(address, storage_key, highest_block_number), shard));
+        }
+
+        Ok(shards)
+    }
+}
+
+/// A point-in-time read snapshot of the `RocksDB` database.
+///
+/// All reads through this snapshot see a consistent view of the database at the point
+/// the snapshot was created, regardless of concurrent writes. This is the primary reader
+/// used by [`EitherReader::RocksDB`](crate::either_writer::EitherReader) for history lookups.
+///
+/// Lighter weight than [`RocksTx`] — no transaction overhead, no write support.
+pub struct RocksReadSnapshot<'db> {
+    inner: RocksReadSnapshotInner<'db>,
+    provider: &'db RocksDBProvider,
+}
+
+/// Inner enum to hold the snapshot for either read-write or secondary mode.
+enum RocksReadSnapshotInner<'db> {
+    /// Snapshot from read-write `OptimisticTransactionDB`.
+    ReadWrite(SnapshotWithThreadMode<'db, OptimisticTransactionDB>),
+    /// Direct reads from a secondary `DB` instance (no snapshot).
+    Secondary(&'db DB),
+}
+
+impl<'db> RocksReadSnapshotInner<'db> {
+    /// Returns a raw iterator over a column family.
+    fn raw_iterator_cf(&self, cf: &rocksdb::ColumnFamily) -> RocksDBRawIterEnum<'_> {
+        match self {
+            Self::ReadWrite(snap) => RocksDBRawIterEnum::ReadWrite(snap.raw_iterator_cf(cf)),
+            Self::Secondary(db) => RocksDBRawIterEnum::ReadOnly(db.raw_iterator_cf(cf)),
+        }
+    }
+}
+
+impl fmt::Debug for RocksReadSnapshot<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RocksReadSnapshot")
+            .field("provider", &self.provider)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'db> RocksReadSnapshot<'db> {
+    /// Gets the column family handle for a table.
+    fn cf_handle<T: Table>(&self) -> Result<&'db rocksdb::ColumnFamily, DatabaseError> {
+        self.provider.get_cf_handle::<T>()
+    }
+
+    /// Gets a value from the specified table.
+    pub fn get<T: Table>(&self, key: T::Key) -> ProviderResult<Option<T::Value>> {
+        let encoded_key = key.encode();
+        let cf = self.cf_handle::<T>()?;
+        let result = match &self.inner {
+            RocksReadSnapshotInner::ReadWrite(snap) => snap.get_cf(cf, encoded_key.as_ref()),
+            RocksReadSnapshotInner::Secondary(db) => db.get_cf(cf, encoded_key.as_ref()),
+        }
+        .map_err(|e| {
+            ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
+                message: e.to_string().into(),
+                code: -1,
+            }))
+        })?;
+
+        Ok(result.and_then(|value| T::Value::decompress(&value).ok()))
+    }
+
+    /// Lookup account history and return [`HistoryInfo`] directly.
+    ///
+    /// `visible_tip` is the highest block considered visible from the companion MDBX snapshot.
+    /// History entries above it are ignored even if they already exist in `RocksDB`.
+    pub fn account_history_info(
+        &self,
+        address: Address,
+        block_number: BlockNumber,
+        lowest_available_block_number: Option<BlockNumber>,
+        visible_tip: BlockNumber,
+    ) -> ProviderResult<HistoryInfo> {
+        let key = ShardedKey::new(address, block_number);
+        self.history_info::<tables::AccountsHistory>(
+            key.encode().as_ref(),
+            block_number,
+            lowest_available_block_number,
+            visible_tip,
+            |key_bytes| Ok(<ShardedKey<Address> as Decode>::decode(key_bytes)?.key == address),
+            |prev_bytes| {
+                <ShardedKey<Address> as Decode>::decode(prev_bytes)
+                    .map(|k| k.key == address)
+                    .unwrap_or(false)
+            },
+        )
+    }
+
+    /// Lookup storage history and return [`HistoryInfo`] directly.
+    ///
+    /// `visible_tip` is the highest block considered visible from the companion MDBX snapshot.
+    /// History entries above it are ignored even if they already exist in `RocksDB`.
+    pub fn storage_history_info(
+        &self,
+        address: Address,
+        storage_key: B256,
+        block_number: BlockNumber,
+        lowest_available_block_number: Option<BlockNumber>,
+        visible_tip: BlockNumber,
+    ) -> ProviderResult<HistoryInfo> {
+        let key = StorageShardedKey::new(address, storage_key, block_number);
+        self.history_info::<tables::StoragesHistory>(
+            key.encode().as_ref(),
+            block_number,
+            lowest_available_block_number,
+            visible_tip,
+            |key_bytes| {
+                let k = <StorageShardedKey as Decode>::decode(key_bytes)?;
+                Ok(k.address == address && k.sharded_key.key == storage_key)
+            },
+            |prev_bytes| {
+                <StorageShardedKey as Decode>::decode(prev_bytes)
+                    .map(|k| k.address == address && k.sharded_key.key == storage_key)
+                    .unwrap_or(false)
+            },
+        )
+    }
+
+    /// Generic history lookup using the snapshot's raw iterator.
+    ///
+    /// The result is derived from the history that is visible through `visible_tip`, not from the
+    /// full contents of `RocksDB`. This lets a reader combine an older MDBX snapshot with a newer
+    /// Rocks snapshot without routing through history entries that MDBX cannot see yet.
+    fn history_info<T>(
+        &self,
+        encoded_key: &[u8],
+        block_number: BlockNumber,
+        lowest_available_block_number: Option<BlockNumber>,
+        visible_tip: BlockNumber,
+        key_matches: impl FnOnce(&[u8]) -> Result<bool, reth_db_api::DatabaseError>,
+        prev_key_matches: impl Fn(&[u8]) -> bool,
+    ) -> ProviderResult<HistoryInfo>
+    where
+        T: Table<Value = BlockNumberList>,
+    {
+        let is_maybe_pruned = lowest_available_block_number.is_some();
+        let fallback = || {
+            Ok(if is_maybe_pruned {
+                HistoryInfo::MaybeInPlainState
+            } else {
+                HistoryInfo::NotYetWritten
+            })
+        };
+
+        let cf = self.cf_handle::<T>()?;
+        let mut iter = self.inner.raw_iterator_cf(cf);
+
+        iter.seek(encoded_key);
+        iter.status().map_err(|e| {
+            ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
+                message: e.to_string().into(),
+                code: -1,
+            }))
+        })?;
+
+        if !iter.valid() {
+            return fallback();
+        }
+
+        let Some(key_bytes) = iter.key() else {
+            return fallback();
+        };
+        if !key_matches(key_bytes)? {
+            return fallback();
+        }
+
+        let Some(value_bytes) = iter.value() else {
+            return fallback();
+        };
+        let chunk = BlockNumberList::decompress(value_bytes)?;
+
+        let (rank, found_block) = compute_history_rank(&chunk, block_number);
+        // Ignore later Rocks history that is ahead of the companion MDBX snapshot.
+        let found_block = found_block.filter(|block| *block <= visible_tip);
+
+        let is_before_first_write = if needs_prev_shard_check(rank, found_block, block_number) {
+            iter.prev();
+            iter.status().map_err(|e| {
+                ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
+                    message: e.to_string().into(),
+                    code: -1,
+                }))
+            })?;
+            let has_prev = iter.valid() && iter.key().is_some_and(&prev_key_matches);
+
+            // If the current shard only contains history above `visible_tip`, there is no usable
+            // later change. Without a previous shard for the same key, fall back to the existing
+            // not-written / maybe-pruned result instead of routing into plain state.
+            if found_block.is_none() && !has_prev {
+                return fallback()
+            }
+
+            !has_prev
+        } else {
+            false
+        };
+
+        Ok(HistoryInfo::from_lookup(
+            found_block,
+            is_before_first_write,
+            lowest_available_block_number,
+        ))
     }
 }
 
@@ -1469,14 +1886,12 @@ impl<'a> RocksDBBatch<'a> {
                 "Auto-committing RocksDB batch"
             );
             let old_batch = std::mem::take(&mut self.inner);
-            self.provider.0.db_rw().write_opt(old_batch, &WriteOptions::default()).map_err(
-                |e| {
-                    ProviderError::Database(DatabaseError::Commit(DatabaseErrorInfo {
-                        message: e.to_string().into(),
-                        code: -1,
-                    }))
-                },
-            )?;
+            self.provider.0.db_rw().write_opt(old_batch, &synced_write_options()).map_err(|e| {
+                ProviderError::Database(DatabaseError::Commit(DatabaseErrorInfo {
+                    message: e.to_string().into(),
+                    code: -1,
+                }))
+            })?;
         }
         Ok(())
     }
@@ -1489,7 +1904,7 @@ impl<'a> RocksDBBatch<'a> {
     /// Panics if the provider is in read-only mode.
     #[instrument(level = "debug", target = "providers::rocksdb", skip_all, fields(batch_len = self.inner.len(), batch_size = self.inner.size_in_bytes()))]
     pub fn commit(self) -> ProviderResult<()> {
-        self.provider.0.db_rw().write_opt(self.inner, &WriteOptions::default()).map_err(|e| {
+        self.provider.0.db_rw().write_opt(self.inner, &synced_write_options()).map_err(|e| {
             ProviderError::Database(DatabaseError::Commit(DatabaseErrorInfo {
                 message: e.to_string().into(),
                 code: -1,
@@ -1612,44 +2027,10 @@ impl<'a> RocksDBBatch<'a> {
     ) -> ProviderResult<()> {
         let indices: Vec<u64> = indices.into_iter().collect();
 
-        if indices.is_empty() {
-            return Ok(());
-        }
-
-        debug_assert!(
-            indices.windows(2).all(|w| w[0] < w[1]),
-            "indices must be strictly increasing: {:?}",
-            indices
-        );
-
-        let last_key = StorageShardedKey::last(address, storage_key);
-        let last_shard_opt = self.provider.get::<tables::StoragesHistory>(last_key.clone())?;
-        let mut last_shard = last_shard_opt.unwrap_or_else(BlockNumberList::empty);
-
-        last_shard.append(indices).map_err(ProviderError::other)?;
-
-        // Fast path: all indices fit in one shard
-        if last_shard.len() <= NUM_OF_INDICES_IN_SHARD as u64 {
-            self.put::<tables::StoragesHistory>(last_key, &last_shard)?;
-            return Ok(());
-        }
-
-        // Slow path: rechunk into multiple shards
-        let chunks = last_shard.iter().chunks(NUM_OF_INDICES_IN_SHARD);
-        let mut chunks_peekable = chunks.into_iter().peekable();
-
-        while let Some(chunk) = chunks_peekable.next() {
-            let shard = BlockNumberList::new_pre_sorted(chunk);
-            let highest_block_number = if chunks_peekable.peek().is_some() {
-                shard.iter().next_back().expect("`chunks` does not return empty list")
-            } else {
-                u64::MAX
-            };
-
-            self.put::<tables::StoragesHistory>(
-                StorageShardedKey::new(address, storage_key, highest_block_number),
-                &shard,
-            )?;
+        for (key, shard) in
+            self.provider.storage_history_shards_to_put(address, storage_key, indices)?
+        {
+            self.put::<tables::StoragesHistory>(key, &shard)?;
         }
 
         Ok(())
@@ -1734,7 +2115,7 @@ impl<'a> RocksDBBatch<'a> {
     /// Generic implementation for both account and storage history pruning.
     /// Mirrors MDBX `prune_shard` semantics. After pruning, the last remaining shard
     /// (if any) will have the sentinel key (`u64::MAX`).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn prune_history_shards_inner<K>(
         &mut self,
         shards: Vec<(K, BlockNumberList)>,
@@ -2272,151 +2653,6 @@ impl<'db> RocksTx<'db> {
             ProviderError::Database(DatabaseError::Other(format!("rollback failed: {e}")))
         })
     }
-
-    /// Lookup account history and return [`HistoryInfo`] directly.
-    ///
-    /// This is a thin wrapper around `history_info` that:
-    /// - Builds the `ShardedKey` for the address + target block.
-    /// - Validates that the found shard belongs to the same address.
-    pub fn account_history_info(
-        &self,
-        address: Address,
-        block_number: BlockNumber,
-        lowest_available_block_number: Option<BlockNumber>,
-    ) -> ProviderResult<HistoryInfo> {
-        let key = ShardedKey::new(address, block_number);
-        self.history_info::<tables::AccountsHistory>(
-            key.encode().as_ref(),
-            block_number,
-            lowest_available_block_number,
-            |key_bytes| Ok(<ShardedKey<Address> as Decode>::decode(key_bytes)?.key == address),
-            |prev_bytes| {
-                <ShardedKey<Address> as Decode>::decode(prev_bytes)
-                    .map(|k| k.key == address)
-                    .unwrap_or(false)
-            },
-        )
-    }
-
-    /// Lookup storage history and return [`HistoryInfo`] directly.
-    ///
-    /// This is a thin wrapper around `history_info` that:
-    /// - Builds the `StorageShardedKey` for address + storage key + target block.
-    /// - Validates that the found shard belongs to the same address and storage slot.
-    pub fn storage_history_info(
-        &self,
-        address: Address,
-        storage_key: B256,
-        block_number: BlockNumber,
-        lowest_available_block_number: Option<BlockNumber>,
-    ) -> ProviderResult<HistoryInfo> {
-        let key = StorageShardedKey::new(address, storage_key, block_number);
-        self.history_info::<tables::StoragesHistory>(
-            key.encode().as_ref(),
-            block_number,
-            lowest_available_block_number,
-            |key_bytes| {
-                let k = <StorageShardedKey as Decode>::decode(key_bytes)?;
-                Ok(k.address == address && k.sharded_key.key == storage_key)
-            },
-            |prev_bytes| {
-                <StorageShardedKey as Decode>::decode(prev_bytes)
-                    .map(|k| k.address == address && k.sharded_key.key == storage_key)
-                    .unwrap_or(false)
-            },
-        )
-    }
-
-    /// Generic history lookup for sharded history tables.
-    ///
-    /// Seeks to the shard containing `block_number`, checks if the key matches via `key_matches`,
-    /// and uses `prev_key_matches` to detect if a previous shard exists for the same key.
-    fn history_info<T>(
-        &self,
-        encoded_key: &[u8],
-        block_number: BlockNumber,
-        lowest_available_block_number: Option<BlockNumber>,
-        key_matches: impl FnOnce(&[u8]) -> Result<bool, reth_db_api::DatabaseError>,
-        prev_key_matches: impl Fn(&[u8]) -> bool,
-    ) -> ProviderResult<HistoryInfo>
-    where
-        T: Table<Value = BlockNumberList>,
-    {
-        // History may be pruned if a lowest available block is set.
-        let is_maybe_pruned = lowest_available_block_number.is_some();
-        let fallback = || {
-            Ok(if is_maybe_pruned {
-                HistoryInfo::MaybeInPlainState
-            } else {
-                HistoryInfo::NotYetWritten
-            })
-        };
-
-        let cf = self.provider.0.cf_handle_rw(T::NAME)?;
-
-        // Create a raw iterator to access key bytes directly.
-        let mut iter: DBRawIteratorWithThreadMode<'_, Transaction<'_, OptimisticTransactionDB>> =
-            self.inner.raw_iterator_cf(&cf);
-
-        // Seek to the smallest key >= encoded_key.
-        iter.seek(encoded_key);
-        Self::raw_iter_status_ok(&iter)?;
-
-        if !iter.valid() {
-            // No shard found at or after target block.
-            //
-            // (MaybeInPlainState) The key may have been written, but due to pruning we may not have
-            // changesets and history, so we need to make a plain state lookup.
-            // (HistoryInfo::NotYetWritten) The key has not been written to at all.
-            return fallback();
-        }
-
-        // Check if the found key matches our target entity.
-        let Some(key_bytes) = iter.key() else {
-            return fallback();
-        };
-        if !key_matches(key_bytes)? {
-            // The found key is for a different entity.
-            return fallback();
-        }
-
-        // Decompress the block list for this shard.
-        let Some(value_bytes) = iter.value() else {
-            return fallback();
-        };
-        let chunk = BlockNumberList::decompress(value_bytes)?;
-        let (rank, found_block) = compute_history_rank(&chunk, block_number);
-
-        // Lazy check for previous shard - only called when needed.
-        // If we can step to a previous shard for this same key, history already exists,
-        // so the target block is not before the first write.
-        let is_before_first_write = if needs_prev_shard_check(rank, found_block, block_number) {
-            iter.prev();
-            Self::raw_iter_status_ok(&iter)?;
-            let has_prev = iter.valid() && iter.key().is_some_and(&prev_key_matches);
-            !has_prev
-        } else {
-            false
-        };
-
-        Ok(HistoryInfo::from_lookup(
-            found_block,
-            is_before_first_write,
-            lowest_available_block_number,
-        ))
-    }
-
-    /// Returns an error if the raw iterator is in an invalid state due to an I/O error.
-    fn raw_iter_status_ok(
-        iter: &DBRawIteratorWithThreadMode<'_, Transaction<'_, OptimisticTransactionDB>>,
-    ) -> ProviderResult<()> {
-        iter.status().map_err(|e| {
-            ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
-                message: e.to_string().into(),
-                code: -1,
-            }))
-        })
-    }
 }
 
 /// Wrapper enum for `RocksDB` iterators that works in both read-write and read-only modes.
@@ -2490,6 +2726,14 @@ impl RocksDBRawIterEnum<'_> {
         }
     }
 
+    /// Moves the iterator to the previous key.
+    fn prev(&mut self) {
+        match self {
+            Self::ReadWrite(iter) => iter.prev(),
+            Self::ReadOnly(iter) => iter.prev(),
+        }
+    }
+
     /// Returns the status of the iterator.
     fn status(&self) -> Result<(), rocksdb::Error> {
         match self {
@@ -2545,6 +2789,39 @@ impl Iterator for RocksDBRawIter<'_> {
                 code: -1,
             })))),
         }
+    }
+}
+
+/// Raw key iterator over a `RocksDB` table (non-transactional).
+pub(crate) struct RocksDBRawKeyIter<'db> {
+    inner: RocksDBRawIterEnum<'db>,
+}
+
+impl fmt::Debug for RocksDBRawKeyIter<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RocksDBRawKeyIter").finish_non_exhaustive()
+    }
+}
+
+impl Iterator for RocksDBRawKeyIter<'_> {
+    type Item = ProviderResult<Box<[u8]>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.inner.valid() {
+            return self.inner.status().err().map(|e| {
+                Err(ProviderError::Database(DatabaseError::Read(DatabaseErrorInfo {
+                    message: e.to_string().into(),
+                    code: -1,
+                })))
+            })
+        }
+
+        let Some(key) = self.inner.key() else {
+            return Some(Err(ProviderError::Database(DatabaseError::Decode)))
+        };
+        let key = Box::from(key);
+        self.inner.next();
+        Some(Ok(key))
     }
 }
 
@@ -2606,7 +2883,7 @@ const fn convert_log_level(level: LogLevel) -> rocksdb::LogLevel {
 mod tests {
     use super::*;
     use crate::providers::HistoryInfo;
-    use alloy_primitives::{Address, TxHash, B256};
+    use alloy_primitives::{Address, Bytes, TxHash, B256};
     use reth_db_api::{
         models::{
             sharded_key::{ShardedKey, NUM_OF_INDICES_IN_SHARD},
@@ -2640,6 +2917,38 @@ mod tests {
         let key = StorageShardedKey::new(Address::ZERO, B256::ZERO, 100);
         provider.put::<tables::StoragesHistory>(key.clone(), &value).unwrap();
         assert!(provider.get::<tables::StoragesHistory>(key).unwrap().is_some());
+
+        drop(provider);
+
+        let column_families = DB::list_cf(&Options::default(), temp_dir.path()).unwrap();
+        assert!(!column_families.iter().any(|name| name == tables::BlockAccessLists::NAME));
+        assert!(!column_families
+            .iter()
+            .any(|name| name == tables::BlockAccessListBlockNumbers::NAME));
+    }
+
+    #[test]
+    fn block_access_lists_store_large_payloads_in_blob_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let provider = RocksDBBuilder::new(temp_dir.path())
+            .with_table::<tables::BlockAccessLists>()
+            .build()
+            .unwrap();
+        let bal_key =
+            reth_db_api::models::StoredBlockAccessListKey::new(1, B256::with_last_byte(1));
+        let bal_value = reth_db_api::models::StoredBlockAccessList::new(Bytes::from(vec![
+            0;
+            DEFAULT_BAL_MIN_BLOB_SIZE as usize +
+                1
+        ]));
+
+        provider.put::<tables::BlockAccessLists>(bal_key, &bal_value).unwrap();
+        provider.flush(&[tables::BlockAccessLists::NAME]).unwrap();
+
+        let has_blob_file = std::fs::read_dir(temp_dir.path()).unwrap().any(|entry| {
+            entry.unwrap().path().extension().is_some_and(|extension| extension == "blob")
+        });
+        assert!(has_blob_file);
     }
 
     #[derive(Debug)]
@@ -2650,6 +2959,55 @@ mod tests {
         const DUPSORT: bool = false;
         type Key = u64;
         type Value = Vec<u8>;
+    }
+
+    #[test]
+    fn test_reopens_with_unknown_column_family() {
+        let temp_dir = TempDir::new().unwrap();
+        let value = b"test_value".to_vec();
+
+        let provider = RocksDBBuilder::new(temp_dir.path())
+            .with_default_tables()
+            .with_table::<TestTable>()
+            .build()
+            .unwrap();
+        provider.put::<TestTable>(42, &value).unwrap();
+        drop(provider);
+
+        let provider = RocksDBBuilder::new(temp_dir.path()).with_default_tables().build().unwrap();
+        assert_eq!(provider.get::<TestTable>(42).unwrap(), Some(value));
+    }
+
+    #[test]
+    fn test_reopens_blob_column_family_with_legacy_table_set() {
+        let temp_dir = TempDir::new().unwrap();
+        let bal_key =
+            reth_db_api::models::StoredBlockAccessListKey::new(1, B256::with_last_byte(1));
+        let bal_value = reth_db_api::models::StoredBlockAccessList::new(Bytes::from(vec![
+            0;
+            DEFAULT_BAL_MIN_BLOB_SIZE as usize +
+                1
+        ]));
+
+        let provider = RocksDBBuilder::new(temp_dir.path())
+            .with_default_tables()
+            .with_table::<tables::BlockAccessLists>()
+            .with_table::<tables::BlockAccessListBlockNumbers>()
+            .build()
+            .unwrap();
+        provider.put::<tables::BlockAccessLists>(bal_key, &bal_value).unwrap();
+        provider
+            .put::<tables::BlockAccessListBlockNumbers>(bal_key.hash(), &bal_key.number())
+            .unwrap();
+        provider.flush(&[tables::BlockAccessLists::NAME]).unwrap();
+        drop(provider);
+
+        let provider = RocksDBBuilder::new(temp_dir.path()).with_default_tables().build().unwrap();
+        assert_eq!(provider.get::<tables::BlockAccessLists>(bal_key).unwrap(), Some(bal_value));
+        assert_eq!(
+            provider.get::<tables::BlockAccessListBlockNumbers>(bal_key.hash()).unwrap(),
+            Some(bal_key.number())
+        );
     }
 
     #[test]
@@ -2950,16 +3308,129 @@ mod tests {
         let shard_key = ShardedKey::new(address, u64::MAX);
         provider.put::<tables::AccountsHistory>(shard_key, &chunk).unwrap();
 
-        let tx = provider.tx();
-
         // Query for block 50 with lowest_available_block_number = 100
         // This simulates a pruned state where data before block 100 is not available.
         // Since we're before the first write AND pruning boundary is set, we need to
         // check the changeset at the first write block.
-        let result = tx.account_history_info(address, 50, Some(100)).unwrap();
+        let result =
+            provider.snapshot().account_history_info(address, 50, Some(100), u64::MAX).unwrap();
         assert_eq!(result, HistoryInfo::InChangeset(100));
+    }
 
-        tx.rollback().unwrap();
+    /// Verifies that a read-only (secondary) provider can catch up with primary writes.
+    #[test]
+    fn test_account_history_info_read_only_and_catch_up() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = Address::from([0x42; 20]);
+        let chunk = IntegerList::new([100, 200, 300]).unwrap();
+        let shard_key = ShardedKey::new(address, u64::MAX);
+
+        // Write data with a read-write provider
+        let rw_provider =
+            RocksDBBuilder::new(temp_dir.path()).with_default_tables().build().unwrap();
+        rw_provider.put::<tables::AccountsHistory>(shard_key, &chunk).unwrap();
+
+        // Open read-only provider — it sees the initial data.
+        let ro_provider = RocksDBBuilder::new(temp_dir.path())
+            .with_default_tables()
+            .with_read_only(true)
+            .build()
+            .unwrap();
+
+        let result =
+            ro_provider.snapshot().account_history_info(address, 200, None, u64::MAX).unwrap();
+        assert_eq!(result, HistoryInfo::InChangeset(200));
+
+        let result =
+            ro_provider.snapshot().account_history_info(address, 50, None, u64::MAX).unwrap();
+        assert_eq!(result, HistoryInfo::NotYetWritten);
+
+        let result =
+            ro_provider.snapshot().account_history_info(address, 400, None, u64::MAX).unwrap();
+        assert_eq!(result, HistoryInfo::InPlainState);
+
+        // Write new data via the primary.
+        let address2 = Address::from([0x43; 20]);
+        let chunk2 = IntegerList::new([500, 600]).unwrap();
+        let shard_key2 = ShardedKey::new(address2, u64::MAX);
+        rw_provider.put::<tables::AccountsHistory>(shard_key2, &chunk2).unwrap();
+
+        // Read-only doesn't see the new data yet.
+        let result =
+            ro_provider.snapshot().account_history_info(address2, 500, None, u64::MAX).unwrap();
+        assert_eq!(result, HistoryInfo::NotYetWritten);
+
+        // Catch up — now it sees the new data.
+        ro_provider.try_catch_up_with_primary().unwrap();
+
+        let result =
+            ro_provider.snapshot().account_history_info(address2, 500, None, u64::MAX).unwrap();
+        assert_eq!(result, HistoryInfo::InChangeset(500));
+    }
+
+    #[test]
+    fn test_account_history_info_ignores_blocks_above_visible_tip() {
+        let temp_dir = TempDir::new().unwrap();
+        let provider = RocksDBBuilder::new(temp_dir.path()).with_default_tables().build().unwrap();
+
+        let address = Address::from([0x42; 20]);
+
+        provider
+            .put::<tables::AccountsHistory>(
+                ShardedKey::new(address, 110),
+                &IntegerList::new([100, 110]).unwrap(),
+            )
+            .unwrap();
+        provider
+            .put::<tables::AccountsHistory>(
+                ShardedKey::new(address, u64::MAX),
+                &IntegerList::new([200, 210]).unwrap(),
+            )
+            .unwrap();
+
+        let result = provider.snapshot().account_history_info(address, 150, None, 150).unwrap();
+        assert_eq!(result, HistoryInfo::InPlainState);
+    }
+
+    #[test]
+    fn test_account_history_info_mixed_shard_respects_visible_tip() {
+        let temp_dir = TempDir::new().unwrap();
+        let provider = RocksDBBuilder::new(temp_dir.path()).with_default_tables().build().unwrap();
+
+        let address = Address::from([0x42; 20]);
+        provider
+            .put::<tables::AccountsHistory>(
+                ShardedKey::new(address, u64::MAX),
+                &IntegerList::new([100, 150, 300]).unwrap(),
+            )
+            .unwrap();
+
+        let result = provider.snapshot().account_history_info(address, 120, None, 200).unwrap();
+        assert_eq!(result, HistoryInfo::InChangeset(150));
+
+        let result = provider.snapshot().account_history_info(address, 201, None, 200).unwrap();
+        assert_eq!(result, HistoryInfo::InPlainState);
+    }
+
+    #[test]
+    fn test_account_history_info_only_stale_entries_use_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let provider = RocksDBBuilder::new(temp_dir.path()).with_default_tables().build().unwrap();
+
+        let address = Address::from([0x42; 20]);
+        provider
+            .put::<tables::AccountsHistory>(
+                ShardedKey::new(address, u64::MAX),
+                &IntegerList::new([200, 210]).unwrap(),
+            )
+            .unwrap();
+
+        let result = provider.snapshot().account_history_info(address, 150, None, 150).unwrap();
+        assert_eq!(result, HistoryInfo::NotYetWritten);
+
+        let result =
+            provider.snapshot().account_history_info(address, 150, Some(100), 150).unwrap();
+        assert_eq!(result, HistoryInfo::MaybeInPlainState);
     }
 
     #[test]
@@ -3831,7 +4302,7 @@ mod tests {
         let storage_key = B256::from([0x01; 32]);
 
         // Test cases that exercise invariants
-        #[allow(clippy::type_complexity)]
+        #[expect(clippy::type_complexity)]
         let invariant_cases: &[(&[(u64, &[u64])], u64)] = &[
             // Account: shards where middle becomes empty
             (&[(10, &[5, 10]), (20, &[15, 20]), (u64::MAX, &[25, 30])], 20),

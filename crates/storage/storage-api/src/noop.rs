@@ -1,16 +1,21 @@
 //! Various noop implementations for traits.
 
+pub use crate::bal::NoopBalStore;
+
 use crate::{
-    AccountReader, BlockBodyIndicesProvider, BlockHashReader, BlockIdReader, BlockNumReader,
-    BlockReader, BlockReaderIdExt, BlockSource, BytecodeReader, ChangeSetReader,
-    HashedPostStateProvider, HeaderProvider, NodePrimitivesProvider, PruneCheckpointReader,
-    ReceiptProvider, ReceiptProviderIdExt, StageCheckpointReader, StateProofProvider,
-    StateProvider, StateProviderBox, StateProviderFactory, StateReader, StateRootProvider,
-    StorageRootProvider, TransactionVariant, TransactionsProvider,
+    AccountReader, BalProvider, BalStoreHandle, BlockBodyIndicesProvider, BlockHashReader,
+    BlockIdReader, BlockNumReader, BlockReader, BlockReaderIdExt, BlockSource, BytecodeReader,
+    ChangeSetReader, HashedPostStateProvider, HeaderProvider, NodePrimitivesProvider,
+    PruneCheckpointReader, ReceiptProvider, ReceiptProviderIdExt, StageCheckpointReader,
+    StateProofProvider, StateProvider, StateProviderBox, StateProviderFactory,
+    StateRangeProviderFactory, StateRangeView, StateReader, StateRootProvider, StorageRootProvider,
+    TransactionVariant, TransactionsProvider, TryIntoHistoricalStateProvider,
 };
 
 #[cfg(feature = "db-api")]
-use crate::{DBProvider, DatabaseProviderFactory, StorageChangeSetReader, StorageSettingsCache};
+use crate::{
+    DBProvider, DatabaseProviderFactory, DbTxProvider, StorageChangeSetReader, StorageSettingsCache,
+};
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::{BlockHashOrNumber, BlockId, BlockNumberOrTag};
@@ -35,8 +40,8 @@ use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use reth_trie_common::{
-    updates::TrieUpdates, AccountProof, HashedPostState, HashedStorage, MultiProof,
-    MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
+    updates::TrieUpdates, AccountProof, ExecutionWitnessMode, HashedPostState, HashedStorage,
+    MultiProof, MultiProofTargets, StorageMultiProof, StorageProof, TrieInput,
 };
 
 /// Supports various api interfaces for testing purposes.
@@ -44,6 +49,7 @@ use reth_trie_common::{
 #[non_exhaustive]
 pub struct NoopProvider<ChainSpec = reth_chainspec::ChainSpec, N = EthPrimitives> {
     chain_spec: Arc<ChainSpec>,
+    bal_store: BalStoreHandle,
     #[cfg(feature = "db-api")]
     tx: TxMock,
     #[cfg(feature = "db-api")]
@@ -56,6 +62,7 @@ impl<ChainSpec, N> NoopProvider<ChainSpec, N> {
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
         Self {
             chain_spec,
+            bal_store: BalStoreHandle::default(),
             #[cfg(feature = "db-api")]
             tx: TxMock::default(),
             #[cfg(feature = "db-api")]
@@ -70,6 +77,7 @@ impl<ChainSpec> NoopProvider<ChainSpec> {
     pub fn eth(chain_spec: Arc<ChainSpec>) -> Self {
         Self {
             chain_spec,
+            bal_store: BalStoreHandle::default(),
             #[cfg(feature = "db-api")]
             tx: TxMock::default(),
             #[cfg(feature = "db-api")]
@@ -96,12 +104,25 @@ impl<ChainSpec, N> Clone for NoopProvider<ChainSpec, N> {
     fn clone(&self) -> Self {
         Self {
             chain_spec: Arc::clone(&self.chain_spec),
+            bal_store: self.bal_store.clone(),
             #[cfg(feature = "db-api")]
             tx: self.tx.clone(),
             #[cfg(feature = "db-api")]
             prune_modes: self.prune_modes.clone(),
             _phantom: Default::default(),
         }
+    }
+}
+
+impl<ChainSpec, N> BalProvider for NoopProvider<ChainSpec, N> {
+    fn bal_store(&self) -> &BalStoreHandle {
+        &self.bal_store
+    }
+}
+
+impl<ChainSpec, N> StateRangeProviderFactory for NoopProvider<ChainSpec, N> {
+    fn state_range_provider(&self, _state_root: B256) -> ProviderResult<Option<StateRangeView>> {
+        Ok(None)
     }
 }
 
@@ -402,10 +423,6 @@ impl<C: Send + Sync, N: NodePrimitives> ChangeSetReader for NoopProvider<C, N> {
     ) -> ProviderResult<Vec<(BlockNumber, AccountBeforeTx)>> {
         Ok(Vec::default())
     }
-
-    fn account_changeset_count(&self) -> ProviderResult<usize> {
-        Ok(0)
-    }
 }
 
 #[cfg(feature = "db-api")]
@@ -435,10 +452,6 @@ impl<C: Send + Sync, N: NodePrimitives> StorageChangeSetReader for NoopProvider<
         Vec<(reth_db_api::models::BlockNumberAddress, reth_primitives_traits::StorageEntry)>,
     > {
         Ok(Vec::default())
-    }
-
-    fn storage_changeset_count(&self) -> ProviderResult<usize> {
-        Ok(0)
     }
 }
 
@@ -512,14 +525,22 @@ impl<C: Send + Sync, N: NodePrimitives> StateProofProvider for NoopProvider<C, N
         Ok(MultiProof::default())
     }
 
-    fn witness(&self, _input: TrieInput, _target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
+    fn witness(
+        &self,
+        _input: TrieInput,
+        _target: HashedPostState,
+        _mode: ExecutionWitnessMode,
+    ) -> ProviderResult<Vec<Bytes>> {
         Ok(Vec::default())
     }
 }
 
 impl<C: Send + Sync, N: NodePrimitives> HashedPostStateProvider for NoopProvider<C, N> {
-    fn hashed_post_state(&self, _bundle_state: &revm_database::BundleState) -> HashedPostState {
-        HashedPostState::default()
+    fn hashed_post_state(
+        &self,
+        _bundle_state: &revm::database::BundleState,
+    ) -> ProviderResult<HashedPostState> {
+        Ok(HashedPostState::default())
     }
 }
 
@@ -608,6 +629,17 @@ impl<C: Send + Sync + 'static, N: NodePrimitives> StateProviderFactory for NoopP
     }
 }
 
+impl<C: Send + Sync + 'static, N: NodePrimitives> TryIntoHistoricalStateProvider
+    for NoopProvider<C, N>
+{
+    fn try_into_history_at_block(
+        self,
+        block_number: BlockNumber,
+    ) -> ProviderResult<StateProviderBox> {
+        self.history_by_block_number(block_number)
+    }
+}
+
 impl<C: Send + Sync, N: NodePrimitives> StageCheckpointReader for NoopProvider<C, N> {
     fn get_stage_checkpoint(&self, _id: StageId) -> ProviderResult<Option<StageCheckpoint>> {
         Ok(None)
@@ -653,13 +685,16 @@ impl<C: Send + Sync, N: Send + Sync> BlockBodyIndicesProvider for NoopProvider<C
 }
 
 #[cfg(feature = "db-api")]
-impl<ChainSpec: Send + Sync, N: NodePrimitives> DBProvider for NoopProvider<ChainSpec, N> {
+impl<ChainSpec: Send + Sync, N: NodePrimitives> DbTxProvider for NoopProvider<ChainSpec, N> {
     type Tx = TxMock;
 
-    fn tx_ref(&self) -> &Self::Tx {
+    fn tx(&self) -> &Self::Tx {
         &self.tx
     }
+}
 
+#[cfg(feature = "db-api")]
+impl<ChainSpec: Send + Sync, N: NodePrimitives> DBProvider for NoopProvider<ChainSpec, N> {
     fn tx_mut(&mut self) -> &mut Self::Tx {
         &mut self.tx
     }

@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
+fixture_variant="${1:-amsterdam}"
+
+case "${fixture_variant}" in
+    amsterdam)
+        eels_fixtures="https://github.com/ethereum/execution-specs/releases/download/tests-glamsterdam-devnet@v7.2.1/fixtures_glamsterdam-devnet.tar.gz"
+        eels_branch="devnets/glamsterdam/7"
+        eels_fork="Amsterdam"
+        ;;
+    osaka)
+        eels_fixtures="https://github.com/ethereum/execution-spec-tests/releases/download/v5.3.0/fixtures_develop.tar.gz"
+        eels_branch="mainnet"
+        eels_fork="Osaka"
+        ;;
+    *)
+        echo "unknown hive fixture variant: ${fixture_variant}"
+        exit 1
+        ;;
+esac
+
 # Create the hive_assets directory
 mkdir hive_assets/
 
@@ -11,8 +30,18 @@ go build .
 
 # Run each hive command in the background for each simulator and wait
 echo "Building images"
-# TODO: test code has been moved from https://github.com/ethereum/execution-spec-tests to https://github.com/ethereum/execution-specs  we need to pin eels branch with `--sim.buildarg branch=<release-branch-name>` once we have the fusaka release tagged on the new repo
-./hive -client reth --sim "ethereum/eels" --sim.buildarg fixtures=https://github.com/ethereum/execution-spec-tests/releases/download/v5.3.0/fixtures_develop.tar.gz -sim.timelimit 1s || true &
+./hive -client reth --sim "ethereum/eels/consume-engine" \
+    --sim.buildarg fixtures="${eels_fixtures}" \
+    --sim.buildarg branch="${eels_branch}" \
+    --sim.timelimit 1s || true &
+./hive -client reth --sim "ethereum/eels/consume-rlp" \
+    --sim.buildarg fixtures="${eels_fixtures}" \
+    --sim.buildarg branch="${eels_branch}" \
+    --sim.timelimit 1s || true &
+./hive -client reth --sim "ethereum/eels/execute-blobs" \
+    --sim.buildarg branch="${eels_branch}" \
+    --sim.buildarg fork="${eels_fork}" \
+    --sim.timelimit 1s || true &
 ./hive -client reth --sim "ethereum/engine" -sim.timelimit 1s || true &
 ./hive -client reth --sim "devp2p" -sim.timelimit 1s || true &
 ./hive -client reth --sim "ethereum/rpc-compat" -sim.timelimit 1s || true &
@@ -30,6 +59,7 @@ docker save hive/simulators/ethereum/engine:latest -o ../hive_assets/engine.tar 
 docker save hive/simulators/ethereum/rpc-compat:latest -o ../hive_assets/rpc_compat.tar & saving_pids+=( $! )
 docker save hive/simulators/ethereum/eels/consume-engine:latest -o ../hive_assets/eels_engine.tar & saving_pids+=( $! )
 docker save hive/simulators/ethereum/eels/consume-rlp:latest -o ../hive_assets/eels_rlp.tar & saving_pids+=( $! )
+docker save hive/simulators/ethereum/eels/execute-blobs:latest -o ../hive_assets/eels_blobs.tar & saving_pids+=( $! )
 docker save hive/simulators/smoke/genesis:latest -o ../hive_assets/smoke_genesis.tar & saving_pids+=( $! )
 docker save hive/simulators/smoke/network:latest -o ../hive_assets/smoke_network.tar & saving_pids+=( $! )
 docker save hive/simulators/ethereum/sync:latest -o ../hive_assets/ethereum_sync.tar & saving_pids+=( $! )

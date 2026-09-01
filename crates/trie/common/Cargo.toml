@@ -30,7 +30,7 @@ itertools = { workspace = true, features = ["use_alloc"] }
 nybbles = { workspace = true, features = ["rlp"] }
 
 # reth
-revm-database.workspace = true
+revm.workspace = true
 
 # `serde` feature
 serde = { workspace = true, optional = true }
@@ -48,6 +48,7 @@ rayon = { workspace = true, optional = true }
 [dev-dependencies]
 reth-primitives-traits = { workspace = true, features = ["serde"] }
 reth-codecs.workspace = true
+alloy-eips.workspace = true
 alloy-genesis.workspace = true
 
 alloy-primitives = { workspace = true, features = ["getrandom"] }
@@ -59,12 +60,10 @@ plain_hasher.workspace = true
 arbitrary = { workspace = true, features = ["derive"] }
 proptest.workspace = true
 proptest-arbitrary-interop.workspace = true
-criterion.workspace = true
 bincode.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
-revm-state.workspace = true
 
 [features]
 default = ["std"]
@@ -84,8 +83,9 @@ std = [
     "serde?/std",
     "serde_with?/std",
     "serde_json/std",
-    "revm-database/std",
-    "revm-state/std",
+    "revm/std",
+    "reth-codecs?/std",
+    "alloy-eips/std",
 ]
 eip1186 = ["alloy-rpc-types-eth/serde", "dep:alloy-serde"]
 serde = [
@@ -99,17 +99,17 @@ serde = [
     "alloy-rpc-types-eth?/serde",
     "reth-primitives-traits/serde",
     "reth-codecs?/serde",
-    "revm-database/serde",
-    "revm-state/serde",
+    "revm/serde",
+    "alloy-eips/serde",
 ]
 reth-codec = ["dep:reth-codecs", "dep:bytes", "dep:arrayvec"]
 serde-bincode-compat = [
     "serde",
-    "reth-primitives-traits/serde-bincode-compat",
     "alloy-consensus/serde-bincode-compat",
     "dep:serde_with",
     "alloy-genesis/serde-bincode-compat",
     "alloy-rpc-types-eth?/serde-bincode-compat",
+    "alloy-eips/serde-bincode-compat",
 ]
 test-utils = [
     "dep:plain_hasher",
@@ -130,14 +130,7 @@ arbitrary = [
     "nybbles/arbitrary",
     "reth-codecs/arbitrary",
     "alloy-rpc-types-eth?/arbitrary",
+    "alloy-eips/arbitrary",
+    "revm/arbitrary",
 ]
 rayon = ["dep:rayon"]
-
-[[bench]]
-name = "prefix_set"
-harness = false
-
-[[bench]]
-name = "hashed_state"
-harness = false
-required-features = ["rayon"]

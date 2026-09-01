@@ -21,12 +21,12 @@ use reth_payload_builder::PayloadBuilderHandle;
 use reth_primitives_traits::NodePrimitives;
 use reth_provider::{
     providers::{BlockchainProvider, ProviderNodeTypes},
-    ProviderFactory, StorageSettingsCache,
+    ProviderFactory,
 };
 use reth_prune::PrunerWithFactory;
 use reth_stages_api::{MetricEventsSender, Pipeline};
+use reth_storage_overlay::OverlayManager;
 use reth_tasks::Runtime;
-use reth_trie_db::ChangesetCache;
 use std::sync::Arc;
 
 /// Builds the engine [`ChainOrchestrator`] that drives the chain forward.
@@ -60,10 +60,11 @@ pub fn build_engine_orchestrator<N, Client, S, V, C>(
     pruner: PrunerWithFactory<ProviderFactory<N>>,
     payload_builder: PayloadBuilderHandle<N::Payload>,
     payload_validator: V,
+    overlay_manager: OverlayManager<N::Primitives>,
     tree_config: TreeConfig,
     sync_metrics_tx: MetricEventsSender,
     evm_config: C,
-    changeset_cache: ChangesetCache,
+    runtime: Runtime,
 ) -> ChainOrchestrator<
     EngineHandler<
         EngineApiRequestHandler<EngineApiRequest<N::Payload, N::Primitives>, N::Primitives>,
@@ -80,7 +81,6 @@ where
     C: ConfigureEvm<Primitives = N::Primitives> + 'static,
 {
     let downloader = BasicBlockDownloader::new(client, consensus.clone());
-    let use_hashed_state = provider.cached_storage_settings().use_hashed_state();
 
     let persistence_handle =
         PersistenceHandle::<N::Primitives>::spawn_service(provider, pruner, sync_metrics_tx);
@@ -94,11 +94,11 @@ where
         persistence_handle,
         payload_builder,
         canonical_in_memory_state,
+        overlay_manager,
         tree_config,
         engine_kind,
         evm_config,
-        changeset_cache,
-        use_hashed_state,
+        runtime,
     );
 
     let engine_handler = EngineApiRequestHandler::new(to_tree_tx, from_tree);

@@ -66,6 +66,7 @@ std = [
     "reth-evm-ethereum?/std",
     "reth-revm?/std",
     "alloy-rpc-types-engine?/std",
+    "reth-codecs?/std",
 ]
 arbitrary = [
     "std",
@@ -152,6 +153,7 @@ jemalloc = [
     "reth-cli-util?/jemalloc",
     "reth-ethereum-cli?/jemalloc",
     "reth-node-core?/jemalloc",
+    "reth-provider?/jemalloc",
 ]
 jemalloc-prof = [
     "jemalloc",
@@ -162,6 +164,7 @@ jemalloc-symbols = [
     "jemalloc-prof",
     "reth-ethereum-cli?/jemalloc-symbols",
 ]
+jit = ["reth-node-ethereum?/jit"]
 js-tracer = [
     "rpc",
     "reth-rpc/js-tracer",
@@ -176,6 +179,11 @@ otlp = [
 ]
 portable = [
     "reth-revm?/portable",
+]
+gmp = [
+    "reth-evm-ethereum?/gmp",
+    "reth-node-ethereum?/gmp",
+    "reth-revm?/gmp",
 ]
 provider = ["storage-api", "tasks", "dep:reth-provider", "dep:reth-db", "dep:reth-codecs"]
 storage-api = ["dep:reth-storage-api"]

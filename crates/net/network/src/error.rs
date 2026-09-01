@@ -1,7 +1,7 @@
 //! Possible errors when interacting with the network.
 
 use crate::session::PendingSessionHandshakeError;
-use reth_dns_discovery::resolver::ResolveError;
+use reth_dns_discovery::resolver::NetError;
 use reth_ecies::ECIESErrorImpl;
 use reth_eth_wire::{
     errors::{EthHandshakeError, EthStreamError, P2PHandshakeError, P2PStreamError},
@@ -62,7 +62,7 @@ pub enum NetworkError {
     ///
     /// See also [`DnsResolver`](reth_dns_discovery::DnsResolver::from_system_conf)
     #[error("failed to configure DNS resolver: {0}")]
-    DnsResolver(#[from] ResolveError),
+    DnsResolver(#[from] NetError),
 }
 
 impl NetworkError {
@@ -114,7 +114,7 @@ impl SessionError for EthStreamError {
                 P2PHandshakeError::NonHelloMessageInHandshake,
             )) => true,
             Self::EthHandshakeError(err) => {
-                #[allow(clippy::match_same_arms)]
+                #[expect(clippy::match_same_arms)]
                 match err {
                     EthHandshakeError::NoResponse => {
                         // this happens when the conn simply stalled
@@ -160,7 +160,7 @@ impl SessionError for EthStreamError {
                 )
             }
             Self::EthHandshakeError(err) => {
-                #[allow(clippy::match_same_arms)]
+                #[expect(clippy::match_same_arms)]
                 match err {
                     EthHandshakeError::NoResponse => {
                         // this happens when the conn simply stalled
@@ -251,6 +251,9 @@ impl SessionError for PendingSessionHandshakeError {
                     ECIESErrorImpl::Secp256k1(_) |
                     ECIESErrorImpl::InvalidHandshake { .. }
             ),
+            // A peer that announces someone else's node id is broken or hostile, and its discovery
+            // record cannot be trusted to point at a usable peer.
+            Self::UnexpectedHandshakeIdentity(_) => true,
             Self::Timeout | Self::UnsupportedExtraCapability => false,
         }
     }
@@ -270,7 +273,7 @@ impl SessionError for PendingSessionHandshakeError {
                     ECIESErrorImpl::InvalidHandshake { .. }
             ),
             Self::Timeout => false,
-            Self::UnsupportedExtraCapability => true,
+            Self::UnsupportedExtraCapability | Self::UnexpectedHandshakeIdentity(_) => true,
         }
     }
 
@@ -279,7 +282,9 @@ impl SessionError for PendingSessionHandshakeError {
             Self::Eth(eth) => eth.should_backoff(),
             Self::Ecies(_) => Some(BackoffKind::Low),
             Self::Timeout => Some(BackoffKind::Medium),
-            Self::UnsupportedExtraCapability => Some(BackoffKind::High),
+            Self::UnsupportedExtraCapability | Self::UnexpectedHandshakeIdentity(_) => {
+                Some(BackoffKind::High)
+            }
         }
     }
 }

@@ -20,9 +20,11 @@ reth-primitives-traits.workspace = true
 
 # ethereum
 alloy-chains = { workspace = true, features = ["rlp"] }
+alloy-eip7928 = { workspace = true, features = ["rlp"], optional = true }
 alloy-eips.workspace = true
 alloy-primitives = { workspace = true, features = ["map"] }
 alloy-rlp = { workspace = true, features = ["derive"] }
+alloy-trie.workspace = true
 alloy-consensus.workspace = true
 
 bytes.workspace = true
@@ -40,6 +42,7 @@ alloy-hardforks.workspace = true
 reth-ethereum-primitives = { workspace = true, features = ["arbitrary"] }
 alloy-primitives = { workspace = true, features = ["arbitrary", "rand"] }
 alloy-consensus = { workspace = true, features = ["arbitrary"] }
+alloy-eip7928 = { workspace = true, features = ["arbitrary", "rlp"] }
 alloy-eips = { workspace = true, features = ["arbitrary"] }
 alloy-genesis.workspace = true
 alloy-chains = { workspace = true, features = ["arbitrary"] }
@@ -47,12 +50,14 @@ arbitrary = { workspace = true, features = ["derive"] }
 proptest.workspace = true
 proptest-arbitrary-interop.workspace = true
 rand.workspace = true
+test-case.workspace = true
 
 [features]
 default = ["std"]
 std = [
     "alloy-chains/std",
     "alloy-consensus/std",
+    "alloy-eip7928?/std",
     "alloy-eips/std",
     "alloy-genesis/std",
     "alloy-primitives/std",
@@ -64,10 +69,13 @@ std = [
     "serde?/std",
     "thiserror/std",
     "reth-chainspec/std",
+    "alloy-trie/std",
 ]
 arbitrary = [
     "reth-ethereum-primitives/arbitrary",
     "alloy-chains/arbitrary",
+    "dep:alloy-eip7928",
+    "alloy-eip7928/arbitrary",
     "dep:arbitrary",
     "dep:proptest",
     "dep:proptest-arbitrary-interop",
@@ -76,6 +84,7 @@ arbitrary = [
     "alloy-eips/arbitrary",
     "alloy-primitives/arbitrary",
     "reth-primitives-traits/arbitrary",
+    "alloy-trie/arbitrary",
 ]
 serde = [
     "dep:serde",
@@ -88,4 +97,6 @@ serde = [
     "reth-primitives-traits/serde",
     "reth-ethereum-primitives/serde",
     "alloy-hardforks/serde",
+    "alloy-eip7928?/serde",
+    "alloy-trie/serde",
 ]

@@ -10,7 +10,6 @@ mod proof;
 mod state;
 mod storage;
 mod trie_cursor;
-mod witness;
 
 pub use hashed_cursor::{
     DatabaseHashedAccountCursor, DatabaseHashedCursorFactory, DatabaseHashedStorageCursor,
@@ -18,13 +17,12 @@ pub use hashed_cursor::{
 pub use prefix_set::load_prefix_sets_with_provider;
 pub use proof::{DatabaseProof, DatabaseStorageProof};
 pub use reth_db_api::tables::{PackedAccountsTrie, PackedStoragesTrie};
-pub use state::{from_reverts_auto, DatabaseHashedPostState, DatabaseStateRoot};
+pub use state::{DatabaseHashedPostState, DatabaseStateRoot};
 pub use storage::{hashed_storage_from_reverts_with_provider, DatabaseStorageRoot};
 pub use trie_cursor::{
     DatabaseAccountTrieCursor, DatabaseStorageTrieCursor, DatabaseTrieCursorFactory,
     LegacyKeyAdapter, PackedKeyAdapter, StorageTrieEntryLike, TrieKeyAdapter, TrieTableAdapter,
 };
-pub use witness::DatabaseTrieWitness;
 
 /// Dispatches a trie operation using the correct [`TrieKeyAdapter`] based on storage settings.
 ///

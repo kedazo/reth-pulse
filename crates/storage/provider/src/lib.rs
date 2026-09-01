@@ -12,6 +12,9 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+/// Utility functions for initializing the database.
+pub mod init;
+
 /// Various provider traits.
 mod traits;
 pub use traits::*;
@@ -21,7 +24,7 @@ pub mod providers;
 pub use providers::{
     DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, HistoricalStateProvider,
     HistoricalStateProviderRef, LatestStateProvider, LatestStateProviderRef, ProviderFactory,
-    PruneShardOutcome, PrunedIndices, SaveBlocksMode, StaticFileAccess, StaticFileProviderBuilder,
+    PruneShardOutcome, PrunedIndices, SaveBlocksInput, StaticFileAccess, StaticFileProviderBuilder,
     StaticFileWriteCtx, StaticFileWriter,
 };
 
@@ -35,18 +38,22 @@ pub mod test_utils;
 pub mod either_writer;
 pub use either_writer::*;
 
+mod bal;
+pub use bal::{BalConfig, InMemoryBalStore, RocksDBBalStore};
+
 pub use reth_chain_state::{
     CanonStateNotification, CanonStateNotificationSender, CanonStateNotificationStream,
     CanonStateNotifications, CanonStateSubscriptions,
 };
 pub use reth_execution_types::*;
 /// Re-export `OriginalValuesKnown`
-pub use revm_database::states::OriginalValuesKnown;
+pub use revm::database::states::OriginalValuesKnown;
 // reexport traits to avoid breaking changes
 pub use reth_static_file_types as static_file;
 pub use reth_storage_api::{
-    HistoryWriter, MetadataProvider, MetadataWriter, StateWriteConfig, StatsReader,
-    StorageSettings, StorageSettingsCache,
+    BalNotification, BalNotificationStream, BalProvider, BalStore, BalStoreHandle,
+    GetBlockAccessListLimit, HistoryWriter, MetadataProvider, MetadataWriter, NoopBalStore, RawBal,
+    StateWriteConfig, StatsReader, StorageSettings, StorageSettingsCache,
 };
 /// Re-export provider error.
 pub use reth_storage_errors::provider::{ProviderError, ProviderResult};

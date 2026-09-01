@@ -1,13 +1,12 @@
-use alloy_eips::eip2718::Encodable2718;
+use alloy_consensus::transaction::TxHashRef;
 use alloy_primitives::{TxHash, TxNumber};
 use num_traits::Zero;
 use reth_config::config::{EtlConfig, TransactionLookupConfig};
-#[cfg(all(unix, feature = "rocksdb"))]
-use reth_db_api::Tables;
 use reth_db_api::{
     table::{Decode, Decompress, Value},
     tables,
     transaction::DbTxMut,
+    Tables,
 };
 use reth_etl::Collector;
 use reth_primitives_traits::{NodePrimitives, SignedTransaction};
@@ -199,7 +198,6 @@ where
             }
         }
 
-        #[cfg(all(unix, feature = "rocksdb"))]
         if provider.cached_storage_settings().storage_v2 {
             provider.commit_pending_rocksdb_batches()?;
             provider.rocksdb_provider().flush(&[Tables::TransactionHashNumbers.name()])?;
@@ -239,7 +237,7 @@ where
                 for transaction in
                     static_file_provider.transactions_by_tx_range(body.tx_num_range())?
                 {
-                    writer.delete_transaction_hash_number(transaction.trie_hash())?;
+                    writer.delete_transaction_hash_number(*transaction.tx_hash())?;
                 }
             }
 
@@ -601,7 +599,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(unix, feature = "rocksdb"))]
     mod rocksdb_tests {
         use super::*;
         use reth_provider::RocksDBProviderFactory;

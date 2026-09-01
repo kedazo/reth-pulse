@@ -1,6 +1,7 @@
 //! Configuration files.
+use reth_network_peers::TrustedPeer;
 use reth_network_types::{PeersConfig, SessionsConfig};
-use reth_prune_types::PruneModes;
+use reth_prune_types::{PruneModes, MINIMUM_UNWIND_SAFE_DISTANCE};
 use reth_stages_types::ExecutionStageThresholds;
 use reth_static_file_types::{StaticFileMap, StaticFileSegment};
 use std::{
@@ -20,6 +21,10 @@ pub const DEFAULT_BLOCK_INTERVAL: usize = 5;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 pub struct Config {
+    /// Nodes to bootstrap P2P discovery with, as `enode://` URLs or `enr:` records.
+    ///
+    /// Takes precedence over the chain spec bootnodes, and is overridden by `--bootnodes`.
+    pub bootnodes: Vec<TrustedPeer>,
     /// Configuration for each stage in the pipeline.
     pub stages: StageConfig,
     /// Configuration for pruning.
@@ -332,11 +337,15 @@ pub struct HashingConfig {
     pub clean_threshold: u64,
     /// The maximum number of entities to process before committing progress to the database.
     pub commit_threshold: u64,
+    /// The maximum number of changeset entries to process before committing progress. The stage
+    /// commits after either `commit_threshold` blocks or `commit_entries` entries, whichever
+    /// comes first. This bounds memory usage when blocks contain many state changes.
+    pub commit_entries: u64,
 }
 
 impl Default for HashingConfig {
     fn default() -> Self {
-        Self { clean_threshold: 500_000, commit_threshold: 100_000 }
+        Self { clean_threshold: 500_000, commit_threshold: 100_000, commit_entries: 30_000_000 }
     }
 }
 
@@ -536,11 +545,24 @@ pub struct PruneConfig {
     /// Pruning configuration for every part of the data that can be pruned.
     #[cfg_attr(feature = "serde", serde(alias = "parts"))]
     pub segments: PruneModes,
+    /// Minimum distance from the tip required for pruning. Controls the safety margin for
+    /// reorgs and manual unwinds. Defaults to [`MINIMUM_UNWIND_SAFE_DISTANCE`].
+    #[cfg_attr(feature = "serde", serde(default = "default_minimum_pruning_distance"))]
+    pub minimum_pruning_distance: u64,
+}
+
+/// Returns the default minimum pruning distance.
+const fn default_minimum_pruning_distance() -> u64 {
+    MINIMUM_UNWIND_SAFE_DISTANCE
 }
 
 impl Default for PruneConfig {
     fn default() -> Self {
-        Self { block_interval: DEFAULT_BLOCK_INTERVAL, segments: PruneModes::default() }
+        Self {
+            block_interval: DEFAULT_BLOCK_INTERVAL,
+            segments: PruneModes::default(),
+            minimum_pruning_distance: MINIMUM_UNWIND_SAFE_DISTANCE,
+        }
     }
 }
 
@@ -573,11 +595,17 @@ impl PruneConfig {
                     bodies_history,
                     receipts_log_filter,
                 },
+            minimum_pruning_distance,
         } = other;
 
         // Merge block_interval, only update if it's the default interval
         if self.block_interval == DEFAULT_BLOCK_INTERVAL {
             self.block_interval = block_interval;
+        }
+
+        // Merge minimum_pruning_distance, only update if it's the default
+        if self.minimum_pruning_distance == MINIMUM_UNWIND_SAFE_DISTANCE {
+            self.minimum_pruning_distance = minimum_pruning_distance;
         }
 
         // Merge the various segment prune modes
@@ -619,7 +647,9 @@ mod tests {
     use crate::PruneConfig;
     use alloy_primitives::Address;
     use reth_network_peers::TrustedPeer;
-    use reth_prune_types::{PruneMode, PruneModes, ReceiptsLogPruneConfig};
+    use reth_prune_types::{
+        PruneMode, PruneModes, ReceiptsLogPruneConfig, MINIMUM_UNWIND_SAFE_DISTANCE,
+    };
     use std::{collections::BTreeMap, path::Path, str::FromStr, time::Duration};
 
     fn with_tempdir(filename: &str, proc: fn(&std::path::Path)) {
@@ -1089,6 +1119,7 @@ receipts = { distance = 16384 }
     fn test_prune_config_merge() {
         let mut config1 = PruneConfig {
             block_interval: 5,
+            minimum_pruning_distance: MINIMUM_UNWIND_SAFE_DISTANCE,
             segments: PruneModes {
                 sender_recovery: Some(PruneMode::Full),
                 transaction_lookup: None,
@@ -1105,6 +1136,7 @@ receipts = { distance = 16384 }
 
         let config2 = PruneConfig {
             block_interval: 10,
+            minimum_pruning_distance: MINIMUM_UNWIND_SAFE_DISTANCE,
             segments: PruneModes {
                 sender_recovery: Some(PruneMode::Distance(500)),
                 transaction_lookup: Some(PruneMode::Full),
@@ -1172,5 +1204,38 @@ connect_trusted_nodes_only = true
             let node = TrustedPeer::from_str(enode).unwrap();
             assert!(conf.peers.trusted_nodes.contains(&node));
         }
+    }
+
+    #[test]
+    fn test_bootnodes() {
+        let reth_toml = r#"
+    bootnodes = [
+        "enode://0401e494dbd0c84c5c0f72adac5985d2f2525e08b68d448958aae218f5ac8198a80d1498e0ebec2ce38b1b18d6750f6e61a56b4614c5a6c6cf0981c39aed47dc@34.159.32.127:30303",
+        "enode://e9675164b5e17b9d9edf0cc2bd79e6b6f487200c74d1331c220abb5b8ee80c2eefbf18213989585e9d0960683e819542e11d4eefb5f2b4019e1e49f9fd8fff18@berav2-bootnode.staketab.org:30303",
+        "enr:-IS4QHCYrYZbAKWCBRlAy5zzaDZXJBGkcnh4MHcBFZntXNFrdvJjX04jRzjzCBOonrkTfj499SZuOh8R33Ls8RRcy5wBgmlkgnY0gmlwhH8AAAGJc2VjcDI1NmsxoQPKY0yuDUmstAHYpMa2_oxVtw0RW_QAdpzBQA8yWM0xOIN1ZHCCdl8"
+    ]
+    "#;
+
+        let conf: Config = toml::from_str(reth_toml).unwrap();
+        assert_eq!(conf.bootnodes.len(), 3);
+        assert_eq!(
+            conf.bootnodes[1].host,
+            url::Host::<String>::Domain("berav2-bootnode.staketab.org".to_string())
+        );
+        // the ENR omits the tcp key, so the udp port is used for the RLPx dial guess
+        assert_eq!(
+            conf.bootnodes[2],
+            TrustedPeer::from_str("enode://ca634cae0d49acb401d8a4c6b6fe8c55b70d115bf400769cc1400f3258cd31387574077f301b421bc84df7266c44e9e6d569fc56be00812904767bf5ccd1fc7f@127.0.0.1:30303").unwrap()
+        );
+
+        // bootnodes are written back as enode URLs, including the ones read as ENRs
+        let serialized = toml::to_string(&conf).unwrap();
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), conf);
+    }
+
+    #[test]
+    fn test_bootnodes_default_empty() {
+        let conf: Config = toml::from_str("").unwrap();
+        assert!(conf.bootnodes.is_empty());
     }
 }

@@ -8,14 +8,14 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+mod execution_stats;
+pub use execution_stats::ExecutionTimingStats;
+
 mod in_memory;
 pub use in_memory::*;
 
-mod deferred_trie;
-pub use deferred_trie::*;
-
-mod lazy_overlay;
-pub use lazy_overlay::*;
+mod preserved_sparse_trie;
+pub use preserved_sparse_trie::*;
 
 mod noop;
 

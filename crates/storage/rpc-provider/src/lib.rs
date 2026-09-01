@@ -54,10 +54,12 @@ use reth_prune_types::{PruneCheckpoint, PruneSegment};
 pub mod rpc_response;
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_storage_api::{
-    BlockBodyIndicesProvider, BlockReaderIdExt, BlockSource, DBProvider, NodePrimitivesProvider,
-    ReceiptProviderIdExt, StatsReader,
+    BlockBodyIndicesProvider, BlockReaderIdExt, BlockSource, DBProvider, DbTxProvider,
+    NodePrimitivesProvider, ReceiptProviderIdExt, StatsReader,
 };
-use reth_trie::{updates::TrieUpdates, AccountProof, HashedPostState, MultiProof, TrieInput};
+use reth_trie::{
+    updates::TrieUpdates, AccountProof, HashedPostState, KeccakKeyHasher, MultiProof, TrieInput,
+};
 pub use rpc_response::{EthRpcConverter, RpcResponseConverter};
 use std::{
     collections::BTreeMap,
@@ -1164,7 +1166,7 @@ where
     Node: NodeTypes,
 {
     fn state_root(&self, hashed_state: HashedPostState) -> Result<B256, ProviderError> {
-        self.state_root_from_nodes(TrieInput::from_state(hashed_state))
+        self.state_root_with_updates(hashed_state).map(|(root, _)| root)
     }
 
     fn state_root_from_nodes(&self, _input: TrieInput) -> Result<B256, ProviderError> {
@@ -1301,6 +1303,7 @@ where
         &self,
         _input: TrieInput,
         _target: HashedPostState,
+        _mode: reth_trie::ExecutionWitnessMode,
     ) -> Result<Vec<alloy_primitives::Bytes>, ProviderError> {
         Err(ProviderError::UnsupportedProvider)
     }
@@ -1313,9 +1316,18 @@ where
     N: Network,
     Node: NodeTypes,
 {
-    fn hashed_post_state(&self, _bundle_state: &revm::database::BundleState) -> HashedPostState {
-        // Return empty hashed post state for RPC provider
-        HashedPostState::default()
+    fn hashed_post_state(
+        &self,
+        bundle_state: &revm::database::BundleState,
+    ) -> ProviderResult<HashedPostState> {
+        if bundle_state
+            .state()
+            .values()
+            .any(|account| account.was_destroyed() && account.original_info.is_some())
+        {
+            return Err(ProviderError::UnsupportedProvider)
+        }
+        Ok(HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state()))
     }
 }
 
@@ -1336,7 +1348,7 @@ where
     }
 }
 
-impl<P, Node, N> DBProvider for RpcBlockchainStateProvider<P, Node, N>
+impl<P, Node, N> DbTxProvider for RpcBlockchainStateProvider<P, Node, N>
 where
     P: Provider<N> + Clone + 'static,
     N: Network,
@@ -1344,12 +1356,19 @@ where
 {
     type Tx = TxMock;
 
-    fn tx_ref(&self) -> &Self::Tx {
+    fn tx(&self) -> &Self::Tx {
         // We can't use a static here since TxMock doesn't allow direct construction
         // This is fine since we're just returning a mock transaction
-        unimplemented!("tx_ref not supported for RPC provider")
+        unimplemented!("tx not supported for RPC provider")
     }
+}
 
+impl<P, Node, N> DBProvider for RpcBlockchainStateProvider<P, Node, N>
+where
+    P: Provider<N> + Clone + 'static,
+    N: Network,
+    Node: NodeTypes,
+{
     fn tx_mut(&mut self) -> &mut Self::Tx {
         unimplemented!("tx_mut not supported for RPC provider")
     }
@@ -1755,10 +1774,6 @@ where
         &self,
         _range: impl std::ops::RangeBounds<BlockNumber>,
     ) -> ProviderResult<Vec<(BlockNumber, reth_db_api::models::AccountBeforeTx)>> {
-        Err(ProviderError::UnsupportedProvider)
-    }
-
-    fn account_changeset_count(&self) -> ProviderResult<usize> {
         Err(ProviderError::UnsupportedProvider)
     }
 }

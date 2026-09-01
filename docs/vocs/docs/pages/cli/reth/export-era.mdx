@@ -92,6 +92,17 @@ Database:
       --db.sync-mode <SYNC_MODE>
           Controls how aggressively the database synchronizes data to disk
 
+      --db.rocksdb-block-cache-size <ROCKSDB_BLOCK_CACHE_SIZE>
+          `RocksDB` block cache size (e.g., 512MB, 4GB).
+
+          Controls the size of the in-memory LRU cache for decompressed `RocksDB` blocks. A larger cache reduces repeated decompression of hot blocks, improving read performance for history lookups.
+
+      --db.balstore-cache-size <BALSTORE_CACHE_SIZE>
+          Number of recent blocks to keep in the in-memory BAL store cache
+
+      --db.disable-metrics
+          Disable built-in database metrics
+
 Static Files:
       --static-files.blocks-per-file.headers <BLOCKS_PER_FILE_HEADERS>
           Number of blocks per file for the headers segment
@@ -112,14 +123,23 @@ Static Files:
           Number of blocks per file for the storage changesets segment
 
 Storage:
-      --storage.v2
-          Enable v2 storage defaults (static files + `RocksDB` routing).
+      --storage.v2 [<V2>]
+          Enable V2 (hot/cold) storage layout for new databases.
 
-          When enabled, the node uses optimized storage settings: - Receipts and transaction senders in static files - History indices in `RocksDB` (accounts, storages, transaction hashes) - Account and storage changesets in static files
+          When set, new databases will be initialized with the V2 storage layout that separates hot and cold data. Existing databases always use the settings persisted in their metadata regardless of this flag.
 
-          This is a genesis-initialization-only setting: changing it after genesis requires a re-sync.
+          [default: true]
+          [possible values: true, false]
 
-          Individual settings can still be overridden with `--static-files.*` and `--rocksdb.*` flags.
+      --file-type <FILE_TYPE>
+          The ERA file format to export: `era1` writes `.era1` files, `ere` writes `.ere` files.
+
+          Possible values:
+          - era1: Execution blocks written in the `.era1` format
+          - ere:  Execution blocks written in the `.ere` format
+          - era:  Consensus-layer `.era` format. Not exportable from an execution client; selecting it is an error
+
+          [default: era1]
 
       --first-block-number <first-block-number>
           Optional first block number to export from the db.
@@ -133,9 +153,9 @@ Storage:
           The maximum number of blocks per file, it can help you to decrease the size of the files.
           Must be less than or equal to 8192.
 
-      --path <EXPORT_ERA1_PATH>
-          The directory path where to export era1 files.
-          The block data are read from the database.
+      --path <EXPORT_PATH>
+          The directory where the exported ERA files are written.
+          Defaults to `<data-dir>/<chain>/<format>-export/`, where `<format>` is `era1` or `ere`.
 
 Logging:
       --log.stdout.format <FORMAT>
@@ -151,7 +171,7 @@ Logging:
       --log.stdout.filter <FILTER>
           The filter to use for logs written to stdout
 
-          [default: ]
+          [default: ""]
 
       --log.file.format <FORMAT>
           The format to use for logs written to the log file

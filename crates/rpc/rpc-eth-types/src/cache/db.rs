@@ -101,8 +101,9 @@ impl reth_storage_api::StateProofProvider for StateProviderTraitObjWrapper {
         &self,
         input: reth_trie::TrieInput,
         target: reth_trie::HashedPostState,
+        mode: reth_trie::ExecutionWitnessMode,
     ) -> reth_errors::ProviderResult<Vec<alloy_primitives::Bytes>> {
-        self.0.witness(input, target)
+        self.0.witness(input, target, mode)
     }
 }
 
@@ -140,7 +141,10 @@ impl reth_storage_api::BlockHashReader for StateProviderTraitObjWrapper {
 }
 
 impl HashedPostStateProvider for StateProviderTraitObjWrapper {
-    fn hashed_post_state(&self, bundle_state: &BundleState) -> reth_trie::HashedPostState {
+    fn hashed_post_state(
+        &self,
+        bundle_state: &BundleState,
+    ) -> ProviderResult<reth_trie::HashedPostState> {
         self.0.hashed_post_state(bundle_state)
     }
 }

@@ -236,6 +236,8 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
     gas_cap: u64,
     /// Maximum number of blocks for `eth_simulateV1`.
     max_simulate_blocks: u64,
+    /// Whether to compute state roots for `eth_simulateV1`.
+    compute_state_root_for_eth_simulate: bool,
     /// The maximum number of blocks into the past for generating state proofs.
     eth_proof_window: u64,
     /// The block number at which the node started
@@ -300,6 +302,7 @@ where
         gas_oracle: GasPriceOracle<N::Provider>,
         gas_cap: impl Into<GasCap>,
         max_simulate_blocks: u64,
+        compute_state_root_for_eth_simulate: bool,
         eth_proof_window: u64,
         blocking_task_pool: BlockingTaskPool,
         fee_history_cache: FeeHistoryCache<ProviderHeader<N::Provider>>,
@@ -341,6 +344,7 @@ where
             gas_oracle,
             gas_cap: gas_cap.into().into(),
             max_simulate_blocks,
+            compute_state_root_for_eth_simulate,
             eth_proof_window,
             starting_block,
             task_spawner,
@@ -435,6 +439,12 @@ where
     #[inline]
     pub const fn max_simulate_blocks(&self) -> u64 {
         self.max_simulate_blocks
+    }
+
+    /// Returns whether state roots are computed for `eth_simulateV1`.
+    #[inline]
+    pub const fn compute_state_root_for_eth_simulate(&self) -> bool {
+        self.compute_state_root_for_eth_simulate
     }
 
     /// Returns a handle to the gas oracle.
@@ -566,6 +576,7 @@ mod tests {
     use alloy_eips::BlockNumberOrTag;
     use alloy_primitives::{Signature, B256, U64};
     use alloy_rpc_types::FeeHistory;
+    use alloy_rpc_types_eth::{Bundle, TransactionRequest};
     use jsonrpsee_types::error::INVALID_PARAMS_CODE;
     use rand::Rng;
     use reth_chain_state::CanonStateSubscriptions;
@@ -575,10 +586,10 @@ mod tests {
     use reth_network_api::noop::NoopNetwork;
     use reth_provider::{
         test_utils::{MockEthProvider, NoopProvider},
-        StageCheckpointReader,
+        PruneCheckpointReader, StageCheckpointReader,
     };
     use reth_rpc_eth_api::{node::RpcNodeCoreAdapter, EthApiServer};
-    use reth_storage_api::{BlockReader, BlockReaderIdExt, StateProviderFactory};
+    use reth_storage_api::{BalProvider, BlockReader, BlockReaderIdExt, StateProviderFactory};
     use reth_testing_utils::generators;
     use reth_transaction_pool::test_utils::{testing_pool, TestPool};
 
@@ -598,6 +609,8 @@ mod tests {
             + StateProviderFactory
             + CanonStateSubscriptions<Primitives = reth_ethereum_primitives::EthPrimitives>
             + StageCheckpointReader
+            + PruneCheckpointReader
+            + BalProvider
             + Unpin
             + Clone
             + 'static,
@@ -761,6 +774,53 @@ mod tests {
         assert!(response.is_err());
         let error_object = response.unwrap_err();
         assert_eq!(error_object.code(), INVALID_PARAMS_CODE);
+    }
+
+    #[tokio::test]
+    async fn test_call_many_maps_provider_block_lookup_error_with_eth_api_conversion() {
+        let eth_api = build_test_eth_api(MockEthProvider::default());
+        let bundles = vec![Bundle {
+            transactions: vec![TransactionRequest::default()],
+            block_override: None,
+        }];
+
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::call_many(
+            &eth_api, bundles, None, None,
+        )
+        .await;
+
+        let err = response.expect_err("call_many should fail when latest block lookup errors");
+        let message = err.message().to_ascii_lowercase();
+        assert!(
+            message.contains("block not found"),
+            "best block lookup should map via EthApiError::from(ProviderError): {message}"
+        );
+        assert!(
+            !message.contains("best block does not exist"),
+            "provider implementation detail should not leak from converted error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_call_many_keeps_header_not_found_when_block_hash_absent() {
+        let eth_api = build_test_eth_api(NoopProvider::default());
+        let bundles = vec![Bundle {
+            transactions: vec![TransactionRequest::default()],
+            block_override: None,
+        }];
+
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::call_many(
+            &eth_api, bundles, None, None,
+        )
+        .await;
+
+        let err =
+            response.expect_err("call_many should fail when latest block hash is unavailable");
+        let message = err.message().to_ascii_lowercase();
+        assert!(
+            message.contains("block not found"),
+            "missing block hash should still map to block-not-found: {message}"
+        );
     }
 
     #[tokio::test]

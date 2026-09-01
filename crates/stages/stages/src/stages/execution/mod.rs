@@ -12,9 +12,10 @@ use reth_exex::{ExExManagerHandle, ExExNotification, ExExNotificationSource};
 use reth_primitives_traits::{format_gas_throughput, BlockBody, NodePrimitives};
 use reth_provider::{
     providers::{StaticFileProvider, StaticFileWriter},
-    BlockHashReader, BlockReader, DBProvider, EitherWriter, ExecutionOutcome, HeaderProvider,
-    LatestStateProviderRef, OriginalValuesKnown, ProviderError, StateWriteConfig, StateWriter,
-    StaticFileProviderFactory, StatsReader, StoragePath, StorageSettingsCache, TransactionVariant,
+    BlockHashReader, BlockReader, DBProvider, EitherWriter, ExecutionOutcome,
+    HashedPostStateProvider, HeaderProvider, LatestStateProviderRef, OriginalValuesKnown,
+    ProviderError, StateWriteConfig, StateWriter, StaticFileProviderFactory, StatsReader,
+    StoragePath, StorageSettingsCache, TransactionVariant,
 };
 use reth_revm::database::StateProviderDatabase;
 use reth_stages_api::{
@@ -23,7 +24,6 @@ use reth_stages_api::{
     UnwindInput, UnwindOutput,
 };
 use reth_static_file_types::StaticFileSegment;
-use reth_trie::KeccakKeyHasher;
 use std::{
     cmp::{max, Ordering},
     collections::BTreeMap,
@@ -36,7 +36,9 @@ use tracing::*;
 
 use super::missing_static_data_error;
 
-mod slot_preimages;
+/// Slot-preimage database for recovering plain storage keys from hashed keys during
+/// pre-Cancun `SELFDESTRUCT` handling.
+pub mod slot_preimages;
 
 /// The execution stage executes all transactions and
 /// update history indexes.
@@ -357,7 +359,9 @@ where
                 })
             })?;
 
-            if let Err(err) = self.consensus.validate_block_post_execution(&block, &result, None) {
+            if let Err(err) =
+                self.consensus.validate_block_post_execution(&block, &result, None, None)
+            {
                 return Err(StageError::Block {
                     block: Box::new(block.block_with_parent()),
                     error: BlockErrorKind::Validation(err),
@@ -493,7 +497,8 @@ where
         provider.write_state(&state, OriginalValuesKnown::Yes, StateWriteConfig::default())?;
 
         if provider.cached_storage_settings().use_hashed_state() {
-            let hashed_state = state.hash_state_slow::<KeccakKeyHasher>();
+            let hashed_state =
+                LatestStateProviderRef::new(provider).hashed_post_state(&state.bundle)?;
             provider.write_hashed_state(&hashed_state.into_sorted())?;
         }
 
@@ -764,6 +769,7 @@ mod tests {
     };
     use reth_prune::PruneModes;
     use reth_prune_types::{PruneMode, ReceiptsLogPruneConfig};
+    use reth_revm::revm::database::{AccountStatus, BundleAccount};
     use reth_stages_api::StageUnitCheckpoint;
     use reth_testing_utils::generators;
     use std::collections::BTreeMap;
@@ -786,6 +792,50 @@ mod tests {
             MERKLE_STAGE_DEFAULT_REBUILD_THRESHOLD,
             ExExManagerHandle::empty(),
         )
+    }
+
+    #[test]
+    fn destroyed_storage_is_materialized_without_reverts() {
+        let factory = create_test_provider_factory();
+        let provider = factory.database_provider_rw().unwrap();
+        let address = Address::repeat_byte(0x11);
+        let hashed_address = keccak256(address);
+        let first_slot = B256::repeat_byte(0x22);
+        let second_slot = B256::repeat_byte(0x33);
+
+        provider
+            .tx_ref()
+            .put::<tables::HashedStorages>(
+                hashed_address,
+                StorageEntry { key: first_slot, value: U256::from(2) },
+            )
+            .unwrap();
+        provider
+            .tx_ref()
+            .put::<tables::HashedStorages>(
+                hashed_address,
+                StorageEntry { key: second_slot, value: U256::from(3) },
+            )
+            .unwrap();
+
+        let mut state = ExecutionOutcome::<()>::default();
+        state.bundle.state.insert(
+            address,
+            BundleAccount::new(
+                Some(Default::default()),
+                None,
+                Default::default(),
+                AccountStatus::Destroyed,
+            ),
+        );
+
+        let hashed_state = provider.latest().hashed_post_state(&state.bundle).unwrap();
+
+        let storage = &hashed_state.storages[&hashed_address];
+        assert!(!storage.wiped);
+        assert_eq!(storage.storage[&first_slot], U256::ZERO);
+        assert_eq!(storage.storage[&second_slot], U256::ZERO);
+        assert!(state.bundle.reverts.is_empty());
     }
 
     #[test]
@@ -1020,41 +1070,46 @@ mod tests {
                 done: true
             } if processed == total && total == block.gas_used);
 
-            let provider = factory.provider().unwrap();
+            {
+                let provider = factory.provider().unwrap();
 
-            // check post state
-            let account1 = address!("0x1000000000000000000000000000000000000000");
-            let account1_info =
-                Account { balance: U256::ZERO, nonce: 0x00, bytecode_hash: Some(code_hash) };
-            let account2 = address!("0x2adc25665018aa1fe0e6bc666dac8fc2697ff9ba");
-            let account2_info = Account {
-                balance: U256::from(0x1bc16d674ece94bau128),
-                nonce: 0x00,
-                bytecode_hash: None,
-            };
-            let account3 = address!("0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b");
-            let account3_info = Account {
-                balance: U256::from(0x3635c9adc5de996b46u128),
-                nonce: 0x01,
-                bytecode_hash: None,
-            };
+                // check post state
+                let account1 = address!("0x1000000000000000000000000000000000000000");
+                let account1_info =
+                    Account { balance: U256::ZERO, nonce: 0x00, bytecode_hash: Some(code_hash) };
+                let account2 = address!("0x2adc25665018aa1fe0e6bc666dac8fc2697ff9ba");
+                let account2_info = Account {
+                    balance: U256::from(0x1bc16d674ece94bau128),
+                    nonce: 0x00,
+                    bytecode_hash: None,
+                };
+                let account3 = address!("0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b");
+                let account3_info = Account {
+                    balance: U256::from(0x3635c9adc5de996b46u128),
+                    nonce: 0x01,
+                    bytecode_hash: None,
+                };
 
-            // assert accounts
-            assert!(
-                matches!(provider.basic_account(&account1), Ok(Some(acc)) if acc == account1_info)
-            );
-            assert!(
-                matches!(provider.basic_account(&account2), Ok(Some(acc)) if acc == account2_info)
-            );
-            assert!(
-                matches!(provider.basic_account(&account3), Ok(Some(acc)) if acc == account3_info)
-            );
-            // assert storage
-            // Get on dupsort would return only first value. This is good enough for this test.
-            assert!(matches!(
-                provider.tx_ref().get::<tables::PlainStorageState>(account1),
-                Ok(Some(entry)) if entry.key == B256::with_last_byte(1) && entry.value == U256::from(2)
-            ));
+                // assert accounts
+                assert!(matches!(
+                    provider.basic_account(&account1),
+                    Ok(Some(acc)) if acc == account1_info
+                ));
+                assert!(matches!(
+                    provider.basic_account(&account2),
+                    Ok(Some(acc)) if acc == account2_info
+                ));
+                assert!(matches!(
+                    provider.basic_account(&account3),
+                    Ok(Some(acc)) if acc == account3_info
+                ));
+                // assert storage
+                // Get on dupsort would return only first value. This is good enough for this test.
+                assert!(matches!(
+                    provider.tx_ref().get::<tables::PlainStorageState>(account1),
+                    Ok(Some(entry)) if entry.key == B256::with_last_byte(1) && entry.value == U256::from(2)
+                ));
+            }
 
             let mut provider = factory.database_provider_rw().unwrap();
             let mut stage = stage();

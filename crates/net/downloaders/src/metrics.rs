@@ -60,6 +60,15 @@ impl BodyDownloaderMetrics {
             _error => self.unexpected_errors.increment(1),
         }
     }
+
+    /// Clear all gauge metrics by setting them to 0.
+    pub fn clear(&self) {
+        self.in_flight_requests.set(0);
+        self.buffered_responses.set(0);
+        self.buffered_blocks.set(0);
+        self.buffered_blocks_size_bytes.set(0);
+        self.queued_blocks.set(0);
+    }
 }
 
 /// Metrics for an individual response, i.e. the size in bytes, and length (number of bodies) in the
@@ -94,6 +103,8 @@ pub struct HeaderDownloaderMetrics {
     pub total_flushed: Counter,
     /// Number of items that were successfully downloaded
     pub total_downloaded: Counter,
+    /// Number of responses that contained fewer headers than requested
+    pub partial_responses: Counter,
     /// The number of requests (can contain more than 1 item) currently in-flight.
     pub in_flight_requests: Gauge,
     /// The number of responses (can contain more than 1 item) in the internal buffer of the

@@ -19,11 +19,12 @@ use reth_node_api::BlockTy;
 use reth_node_events::node::NodeEvent;
 use reth_provider::{
     providers::ProviderNodeTypes, BlockNumReader, HeaderProvider, ProviderError, ProviderFactory,
-    StageCheckpointReader,
+    RocksDBProviderFactory, StageCheckpointReader,
 };
 use reth_prune::PruneModes;
 use reth_stages::{prelude::*, ControlFlow, Pipeline, StageId, StageSet};
 use reth_static_file::StaticFileProducer;
+use reth_storage_api::StorageSettingsCache;
 use std::{path::Path, sync::Arc};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -108,7 +109,11 @@ where
 
     let provider = provider_factory.provider()?;
     let init_blocks = provider.tx_ref().entries::<tables::HeaderNumbers>()?;
-    let init_txns = provider.tx_ref().entries::<tables::TransactionHashNumbers>()?;
+    let init_txns = if provider_factory.cached_storage_settings().storage_v2 {
+        provider_factory.rocksdb_provider().iter::<tables::TransactionHashNumbers>()?.count()
+    } else {
+        provider.tx_ref().entries::<tables::TransactionHashNumbers>()?
+    };
     drop(provider);
 
     let mut total_decoded_blocks = 0;
@@ -126,13 +131,24 @@ where
     let mut bad_block_number: Option<u64> = None;
     let mut last_valid_block_number: Option<u64> = None;
 
-    while let Some(file_client) =
-        reader.next_chunk::<BlockTy<N>>(consensus.clone(), Some(sealed_header)).await?
+    let skip_invalid_blocks = !import_config.fail_on_invalid_block;
+    while let Some(file_client) = reader
+        .next_chunk_with_invalid_block_handling::<BlockTy<N>>(
+            consensus.clone(),
+            Some(sealed_header.clone()),
+            skip_invalid_blocks,
+        )
+        .await?
     {
         // create a new FileClient from chunk read from file
         info!(target: "reth::import",
             "Importing chain file chunk"
         );
+
+        if file_client.headers_len() == 0 {
+            debug!(target: "reth::import", "Skipping chain file chunk without valid blocks");
+            continue;
+        }
 
         let tip = file_client.tip().ok_or(eyre::eyre!("file client has no tip"))?;
         info!(target: "reth::import", "Chain file chunk read");
@@ -215,8 +231,12 @@ where
 
     let provider = provider_factory.provider()?;
     let total_imported_blocks = provider.tx_ref().entries::<tables::HeaderNumbers>()? - init_blocks;
-    let total_imported_txns =
-        provider.tx_ref().entries::<tables::TransactionHashNumbers>()? - init_txns;
+    let current_txns = if provider_factory.cached_storage_settings().storage_v2 {
+        provider_factory.rocksdb_provider().iter::<tables::TransactionHashNumbers>()?.count()
+    } else {
+        provider.tx_ref().entries::<tables::TransactionHashNumbers>()?
+    };
+    let total_imported_txns = current_txns - init_txns;
 
     let result = ImportResult {
         total_decoded_blocks,

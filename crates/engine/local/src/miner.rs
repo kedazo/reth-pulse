@@ -6,9 +6,7 @@ use eyre::OptionExt;
 use futures_util::{stream::Fuse, Stream, StreamExt};
 use reth_engine_primitives::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
-use reth_payload_primitives::{
-    BuiltPayload, EngineApiMessageVersion, PayloadAttributesBuilder, PayloadKind, PayloadTypes,
-};
+use reth_payload_primitives::{BuiltPayload, PayloadAttributesBuilder, PayloadKind, PayloadTypes};
 use reth_primitives_traits::{HeaderTy, SealedHeaderFor};
 use reth_storage_api::BlockReader;
 use reth_transaction_pool::TransactionPool;
@@ -16,6 +14,7 @@ use std::{
     collections::VecDeque,
     fmt,
     future::Future,
+    num::NonZeroUsize,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -23,6 +22,9 @@ use std::{
 use tokio::time::Interval;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::error;
+
+/// Default number of confirmations required before a block is finalized in dev mode.
+pub const DEFAULT_FINALITY_DEPTH: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
 /// A mining mode for the local dev engine.
 pub enum MiningMode<Pool: TransactionPool + Unpin> {
@@ -110,21 +112,19 @@ impl<Pool: TransactionPool + Unpin> Future for MiningMode<Pool> {
                         return Poll::Ready(());
                     }
                 }
-                Poll::Pending
             }
             Self::Interval(interval) => {
                 if interval.poll_tick(cx).is_ready() {
                     return Poll::Ready(())
                 }
-                Poll::Pending
             }
             Self::Trigger(trigger) => {
                 if trigger.poll_next_unpin(cx).is_ready() {
                     return Poll::Ready(())
                 }
-                Poll::Pending
             }
         }
+        Poll::Pending
     }
 }
 
@@ -143,6 +143,13 @@ pub struct LocalMiner<T: PayloadTypes, B, Pool: TransactionPool + Unpin> {
     last_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
     /// Stores latest mined blocks.
     last_block_hashes: VecDeque<B256>,
+    /// Number of confirmations required before a block is finalized.
+    finality_depth: NonZeroUsize,
+    /// Optional sleep duration between initiating payload building and resolving.
+    ///
+    /// When set, the miner sleeps after `fork_choice_updated` before calling
+    /// `resolve_kind`, giving the payload job time for multiple rebuild attempts.
+    payload_wait_time: Option<Duration>,
 }
 
 impl<T, B, Pool> LocalMiner<T, B, Pool>
@@ -171,8 +178,22 @@ where
             mode,
             payload_builder,
             last_block_hashes: VecDeque::from([last_header.hash()]),
+            finality_depth: DEFAULT_FINALITY_DEPTH,
             last_header,
+            payload_wait_time: None,
         }
+    }
+
+    /// Sets the number of confirmations required before a block is finalized.
+    pub const fn with_finality_depth(mut self, finality_depth: NonZeroUsize) -> Self {
+        self.finality_depth = finality_depth;
+        self
+    }
+
+    /// Sets the payload wait time, if any.
+    pub const fn with_payload_wait_time_opt(mut self, wait_time: Option<Duration>) -> Self {
+        self.payload_wait_time = wait_time;
+        self
     }
 
     /// Runs the [`LocalMiner`] in a loop, polling the miner and building payloads.
@@ -198,29 +219,24 @@ where
 
     /// Returns current forkchoice state.
     fn forkchoice_state(&self) -> ForkchoiceState {
+        let finality_depth = self.finality_depth.get();
         ForkchoiceState {
-            head_block_hash: *self.last_block_hashes.back().expect("at least 1 block exists"),
-            safe_block_hash: *self
-                .last_block_hashes
-                .get(self.last_block_hashes.len().saturating_sub(32))
-                .expect("at least 1 block exists"),
-            finalized_block_hash: *self
-                .last_block_hashes
-                .get(self.last_block_hashes.len().saturating_sub(64))
-                .expect("at least 1 block exists"),
+            head_block_hash: block_hash_at_depth(&self.last_block_hashes, 1),
+            safe_block_hash: block_hash_at_depth(
+                &self.last_block_hashes,
+                finality_depth.div_ceil(2),
+            ),
+            finalized_block_hash: block_hash_at_depth(&self.last_block_hashes, finality_depth),
         }
     }
 
     /// Sends a FCU to the engine.
     async fn update_forkchoice_state(&self) -> eyre::Result<()> {
         let state = self.forkchoice_state();
-        let res = self
-            .to_engine
-            .fork_choice_updated(state, None, EngineApiMessageVersion::default())
-            .await?;
+        let res = self.to_engine.fork_choice_updated(state, None).await?;
 
         if !res.is_valid() {
-            eyre::bail!("Invalid fork choice update {state:?}: {res:?}")
+            eyre::bail!("Invalid fork choice update {state:?}: {res:?}");
         }
 
         Ok(())
@@ -234,37 +250,58 @@ where
             .fork_choice_updated(
                 self.forkchoice_state(),
                 Some(self.payload_attributes_builder.build(&self.last_header)),
-                EngineApiMessageVersion::default(),
             )
             .await?;
 
         if !res.is_valid() {
-            eyre::bail!("Invalid payload status")
+            eyre::bail!("Invalid payload status");
         }
 
         let payload_id = res.payload_id.ok_or_eyre("No payload id")?;
 
+        if let Some(wait_time) = self.payload_wait_time {
+            tokio::time::sleep(wait_time).await;
+        }
+
         let Some(Ok(payload)) =
             self.payload_builder.resolve_kind(payload_id, PayloadKind::WaitForPending).await
         else {
-            eyre::bail!("No payload")
+            eyre::bail!("No payload");
         };
 
         let header = payload.block().sealed_header().clone();
-        let payload = T::block_to_payload(payload.block().clone());
-        let res = self.to_engine.new_payload(payload).await?;
+        let res = self.to_engine.new_payload(payload.into()).await?;
 
         if !res.is_valid() {
-            eyre::bail!("Invalid payload")
+            eyre::bail!("Invalid payload");
         }
 
         self.last_block_hashes.push_back(header.hash());
         self.last_header = header;
-        // ensure we keep at most 64 blocks
-        if self.last_block_hashes.len() > 64 {
+        // Ensure we retain only the hashes needed to calculate the finalized block.
+        if self.last_block_hashes.len() > self.finality_depth.get() {
             self.last_block_hashes.pop_front();
         }
 
         Ok(())
+    }
+}
+
+fn block_hash_at_depth(block_hashes: &VecDeque<B256>, depth: usize) -> B256 {
+    *block_hashes.get(block_hashes.len().saturating_sub(depth)).expect("at least 1 block exists")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_hash_at_configured_depth() {
+        let block_hashes = (0..64).map(B256::with_last_byte).collect();
+
+        assert_eq!(block_hash_at_depth(&block_hashes, 1), B256::with_last_byte(63));
+        assert_eq!(block_hash_at_depth(&block_hashes, 32), B256::with_last_byte(32));
+        assert_eq!(block_hash_at_depth(&block_hashes, 64), B256::with_last_byte(0));
+        assert_eq!(block_hash_at_depth(&block_hashes, 128), B256::with_last_byte(0));
     }
 }

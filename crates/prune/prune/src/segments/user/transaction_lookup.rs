@@ -3,12 +3,12 @@ use crate::{
     segments::{PruneInput, Segment, SegmentOutput},
     PrunerError,
 };
-use alloy_eips::eip2718::Encodable2718;
-use rayon::prelude::*;
-use reth_db_api::{tables, transaction::DbTxMut};
+use alloy_primitives::TxNumber;
+use reth_db_api::{table::Value, tables, transaction::DbTxMut};
+use reth_primitives_traits::{NodePrimitives, SignedTransaction};
 use reth_provider::{
     BlockReader, DBProvider, PruneCheckpointReader, RocksDBProviderFactory,
-    StaticFileProviderFactory,
+    StaticFileProviderFactory, TransactionsProviderExt,
 };
 use reth_prune_types::{
     PruneCheckpoint, PruneMode, PruneProgress, PrunePurpose, PruneSegment, SegmentOutputCheckpoint,
@@ -31,11 +31,13 @@ impl TransactionLookup {
 impl<Provider> Segment<Provider> for TransactionLookup
 where
     Provider: DBProvider<Tx: DbTxMut>
-        + BlockReader<Transaction: Encodable2718>
+        + BlockReader<Transaction: SignedTransaction>
         + PruneCheckpointReader
-        + StaticFileProviderFactory
         + StorageSettingsCache
-        + RocksDBProviderFactory,
+        + RocksDBProviderFactory
+        + StaticFileProviderFactory<
+            Primitives: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>,
+        >,
 {
     fn segment(&self) -> PruneSegment {
         PruneSegment::TransactionLookup
@@ -95,7 +97,6 @@ where
         .into_inner();
 
         // Check where transaction hash numbers are stored
-        #[cfg(all(unix, feature = "rocksdb"))]
         if provider.cached_storage_settings().storage_v2 {
             return self.prune_rocksdb(provider, input, start, end);
         }
@@ -132,11 +133,16 @@ where
                 .unwrap();
         let tx_range_end = *tx_range.end();
 
-        // Retrieve transactions in the range and calculate their hashes in parallel
         let mut hashes = provider
-            .transactions_by_tx_range(tx_range.clone())?
-            .into_par_iter()
-            .map(|transaction| transaction.trie_hash())
+            .static_file_provider()
+            .transaction_hashes_by_range(
+                *tx_range.start()..
+                    tx_range_end
+                        .checked_add(1)
+                        .ok_or(PrunerError::InconsistentData("Transaction range end overflow"))?,
+            )?
+            .into_iter()
+            .map(|(hash, _)| hash)
             .collect::<Vec<_>>();
 
         // Sort hashes to enable efficient cursor traversal through the TransactionHashNumbers
@@ -196,19 +202,20 @@ impl TransactionLookup {
     ///
     /// Reads transactions from static files and deletes corresponding entries
     /// from the `RocksDB` `TransactionHashNumbers` table.
-    #[cfg(all(unix, feature = "rocksdb"))]
     fn prune_rocksdb<Provider>(
         &self,
         provider: &Provider,
         input: PruneInput,
-        start: alloy_primitives::TxNumber,
-        end: alloy_primitives::TxNumber,
+        start: TxNumber,
+        end: TxNumber,
     ) -> Result<SegmentOutput, PrunerError>
     where
         Provider: DBProvider
-            + BlockReader<Transaction: Encodable2718>
-            + StaticFileProviderFactory
-            + RocksDBProviderFactory,
+            + BlockReader<Transaction: SignedTransaction>
+            + RocksDBProviderFactory
+            + StaticFileProviderFactory<
+                Primitives: NodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>,
+            >,
     {
         // For PruneMode::Full, clear the entire RocksDB table in one operation
         if self.mode.is_full() {
@@ -237,12 +244,12 @@ impl TransactionLookup {
             .map_or(end, |limited| limited.min(end));
         let tx_range = start..=tx_range_end;
 
-        // Retrieve transactions in the range and calculate their hashes in parallel
-        let hashes: Vec<_> = provider
-            .transactions_by_tx_range(tx_range.clone())?
-            .into_par_iter()
-            .map(|transaction| transaction.trie_hash())
-            .collect();
+        let hashes = provider.static_file_provider().transaction_hashes_by_range(
+            *tx_range.start()..
+                tx_range_end
+                    .checked_add(1)
+                    .ok_or(PrunerError::InconsistentData("Transaction range end overflow"))?,
+        )?;
 
         // Number of transactions retrieved from the database should match the tx range count
         let tx_count = tx_range.count();
@@ -257,7 +264,7 @@ impl TransactionLookup {
         // Delete transaction hash -> number mappings from RocksDB
         let mut deleted = 0usize;
         provider.with_rocksdb_batch(|mut batch| {
-            for hash in &hashes {
+            for (hash, _) in &hashes {
                 if limiter.is_limit_reached() {
                     break;
                 }
@@ -438,7 +445,6 @@ mod tests {
         test_prune(10, (PruneProgress::Finished, 8));
     }
 
-    #[cfg(all(unix, feature = "rocksdb"))]
     #[test]
     fn prune_rocksdb() {
         use reth_db_api::models::StorageSettings;
@@ -539,7 +545,6 @@ mod tests {
     /// 1. Some transactions have already been pruned (checkpoint at tx 5)
     /// 2. The deleted entries limit is exhausted before any new deletions
     /// 3. The checkpoint should NOT advance to the next start position
-    #[cfg(all(unix, feature = "rocksdb"))]
     #[test]
     fn prune_rocksdb_zero_deleted_checkpoint() {
         use reth_db_api::models::StorageSettings;

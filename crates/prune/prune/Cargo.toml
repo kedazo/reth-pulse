@@ -27,7 +27,6 @@ reth-static-file-types.workspace = true
 
 # ethereum
 alloy-consensus.workspace = true
-alloy-eips.workspace = true
 
 # metrics
 reth-metrics.workspace = true
@@ -38,19 +37,14 @@ alloy-primitives.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 itertools.workspace = true
-rayon.workspace = true
 tokio.workspace = true
 rustc-hash.workspace = true
-
-[features]
-rocksdb = ["reth-provider/rocksdb"]
 
 [dev-dependencies]
 # reth
 reth-db = { workspace = true, features = ["test-utils"] }
-reth-stages = { workspace = true, features = ["test-utils", "rocksdb"] }
+reth-stages = { workspace = true, features = ["test-utils"] }
 reth-primitives-traits = { workspace = true, features = ["arbitrary"] }
-reth-storage-api.workspace = true
 reth-testing-utils.workspace = true
 reth-tracing.workspace = true
 

@@ -5,7 +5,7 @@ use crate::{
 };
 use alloy_chains::Chain;
 use alloy_primitives::B256;
-use reth_eth_wire_types::EthVersion;
+use reth_eth_wire_types::{snap::SnapProtocolError, EthVersion};
 use reth_ethereum_forks::ValidationError;
 use reth_primitives_traits::{GotExpected, GotExpectedBoxed};
 use std::io;
@@ -25,6 +25,9 @@ pub enum EthStreamError {
     /// Thrown when decoding a message failed.
     #[error(transparent)]
     InvalidMessage(#[from] MessageError),
+    /// Thrown when decoding an inbound `snap` protocol message failed.
+    #[error(transparent)]
+    InvalidSnapMessage(#[from] SnapProtocolError),
     #[error("message size ({0}) exceeds max length (10MB)")]
     /// Received a message whose size exceeds the standard limit.
     MessageTooBig(usize),
@@ -61,6 +64,29 @@ impl EthStreamError {
         } else {
             None
         }
+    }
+
+    /// Returns whether this error indicates a protocol breach on the receive side.
+    ///
+    /// These are errors caused by the remote peer sending invalid or malformed data
+    /// that warrant disconnecting with [`DisconnectReason::ProtocolBreach`].
+    pub const fn is_protocol_breach(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidMessage(_) |
+                Self::InvalidSnapMessage(_) |
+                Self::MessageTooBig(_) |
+                Self::TransactionHashesInvalidLenOfFields { .. } |
+                Self::UnsupportedMessage { .. } |
+                Self::P2PStreamError(
+                    P2PStreamError::Rlp(_) |
+                        P2PStreamError::Snap(_) |
+                        P2PStreamError::MessageTooBig { .. } |
+                        P2PStreamError::UnknownReservedMessageId(_) |
+                        P2PStreamError::EmptyProtocolMessage |
+                        P2PStreamError::UnknownDisconnectReason(_)
+                )
+        )
     }
 
     /// Returns the [`io::Error`] if it was caused by IO

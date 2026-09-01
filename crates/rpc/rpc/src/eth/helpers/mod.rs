@@ -5,6 +5,7 @@ pub mod signer;
 pub mod sync_listener;
 pub mod types;
 
+mod bal;
 mod block;
 mod call;
 mod fees;
@@ -12,6 +13,7 @@ mod pending_block;
 mod receipt;
 mod spec;
 mod state;
+mod subscriptions;
 mod trace;
 mod transaction;
 

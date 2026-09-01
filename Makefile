@@ -17,6 +17,9 @@ FEATURES ?=
 # Cargo profile for builds. Default is for local builds, CI uses an override.
 PROFILE ?= release
 
+# Extra RUSTFLAGS to append to build targets (e.g., "-C target-cpu=x86-64-v3")
+EXTRA_RUSTFLAGS ?=
+
 # Extra flags for Cargo
 CARGO_INSTALL_EXTRA_FLAGS ?=
 
@@ -67,14 +70,14 @@ build-%-reproducible:
 	LC_ALL=C \
 	TZ=UTC \
 	JEMALLOC_OVERRIDE=/usr/lib/x86_64-linux-gnu/libjemalloc.a \
-	cargo build --bin reth --features "$(FEATURES) jemalloc-unprefixed" --profile "reproducible" --locked --target x86_64-unknown-linux-gnu
+	cargo build --bin reth --features "$(FEATURES)" --profile "reproducible" --locked --target x86_64-unknown-linux-gnu
 
 .PHONY: build-debug
 build-debug: ## Build the reth binary into `target/debug` directory.
 	cargo build --bin reth --features "$(FEATURES)"
 # Builds the reth binary natively.
 build-native-%:
-	cargo build --bin reth --target $* --features "$(FEATURES)" --profile "$(PROFILE)"
+	$(if $(EXTRA_RUSTFLAGS),RUSTFLAGS="$(EXTRA_RUSTFLAGS)") cargo build --bin reth --target $* --features "$(FEATURES)" --profile "$(PROFILE)"
 
 # The following commands use `cross` to build a cross-compile.
 #
@@ -92,11 +95,12 @@ build-native-%:
 # on other systems. JEMALLOC_SYS_WITH_LG_PAGE=16 tells jemalloc to use 64-KiB
 # pages. See: https://github.com/paradigmxyz/reth/issues/6742
 build-aarch64-unknown-linux-gnu: export JEMALLOC_SYS_WITH_LG_PAGE=16
+build-native-aarch64-unknown-linux-gnu: export JEMALLOC_SYS_WITH_LG_PAGE=16
 
 # Note: The additional rustc compiler flags are for intrinsics needed by MDBX.
 # See: https://github.com/cross-rs/cross/wiki/FAQ#undefined-reference-with-build-std
 build-%:
-	RUSTFLAGS="-C link-arg=-lgcc -Clink-arg=-static-libgcc" \
+	RUSTFLAGS="-C link-arg=-lgcc -Clink-arg=-static-libgcc $(EXTRA_RUSTFLAGS)" \
 		cross build --bin reth --target $* --features "$(FEATURES)" --profile "$(PROFILE)"
 
 # Unfortunately we can't easily use cross to build for Darwin because of licensing issues.
@@ -128,9 +132,11 @@ build-deb-%:
 # Create a `.tar.gz` containing a binary for a specific target.
 define tarball_release_binary
 	cp $(CARGO_TARGET_DIR)/$(1)/$(PROFILE)/$(2) $(BIN_DIR)/$(2)
+	cp -R LICENSES $(BIN_DIR)/LICENSES
+	cp README.md $(BIN_DIR)/README.md
 	cd $(BIN_DIR) && \
-		tar -czf reth-$(GIT_TAG)-$(1)$(3).tar.gz $(2) && \
-		rm $(2)
+		tar -czf reth-$(GIT_TAG)-$(1)$(3).tar.gz $(2) LICENSES README.md && \
+		rm -r $(2) LICENSES README.md
 endef
 
 # The current git tag will be used as the version in the output file names. You
@@ -188,18 +194,6 @@ $(EEST_TESTS_DIR):
 ef-tests: $(EF_TESTS_DIR) $(EEST_TESTS_DIR) ## Runs Legacy and EEST tests.
 	cargo nextest run --no-fail-fast -p ef-tests --release --features ef-tests
 
-##@ reth-bench
-
-.PHONY: reth-bench
-reth-bench: ## Build the reth-bench binary into the `target` directory.
-	cargo build --manifest-path bin/reth-bench/Cargo.toml --features "$(FEATURES)" --profile "$(PROFILE)"
-
-.PHONY: install-reth-bench
-install-reth-bench: ## Build and install the reth binary under `$(CARGO_HOME)/bin`.
-	cargo install --path bin/reth-bench --bin reth-bench --force --locked \
-		--features "$(FEATURES)" \
-		--profile "$(PROFILE)"
-
 ##@ Other
 
 .PHONY: clean
@@ -241,7 +235,7 @@ maxperf: ## Builds `reth` with the most aggressive optimisations.
 
 .PHONY: maxperf-no-asm
 maxperf-no-asm: ## Builds `reth` with the most aggressive optimisations, minus the "asm-keccak" feature.
-	RUSTFLAGS="-C target-cpu=native" cargo build --profile maxperf --no-default-features --features jemalloc,min-debug-logs,otlp,otlp-logs,reth-revm/portable,js-tracer,keccak-cache-global,rocksdb
+	RUSTFLAGS="-C target-cpu=native" cargo build --profile maxperf --no-default-features --features jemalloc,min-trace-logs,otlp,otlp-logs,reth-revm/portable,js-tracer,keccak-cache-global,gmp,rocksdb
 
 fmt:
 	cargo +nightly fmt
