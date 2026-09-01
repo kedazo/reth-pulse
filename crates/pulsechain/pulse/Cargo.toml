@@ -1,0 +1,33 @@
+[package]
+name = "reth-pulsechain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "PulseChain fork logic for pulse-reth"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-execution-errors.workspace = true
+
+# ethereum
+alloy-primitives.workspace = true
+
+# utilities
+hex = "0.4"
+tokio = { workspace = true, features = ["sync", "rt"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default = ["std"]
+std = [
+    "alloy-primitives/std",
+]

@@ -1,0 +1,45 @@
+[package]
+name = "reth-pulsechain-chainspec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "PulseChain chain specification for pulse-reth"
+
+[lints]
+workspace = true
+
+[dependencies]
+# reth
+reth-chainspec.workspace = true
+reth-network-peers.workspace = true
+reth-primitives-traits.workspace = true
+reth-pulsechain-forks.workspace = true
+
+# ethereum
+alloy-chains = { workspace = true, features = ["serde"] }
+alloy-genesis.workspace = true
+alloy-primitives.workspace = true
+
+# misc
+once_cell.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+reth-ethereum-forks.workspace = true
+
+[features]
+default = ["std"]
+std = [
+    "reth-chainspec/std",
+    "reth-network-peers/std",
+    "reth-primitives-traits/std",
+    "reth-pulsechain-forks/std",
+    "alloy-chains/std",
+    "alloy-genesis/std",
+    "alloy-primitives/std",
+    "once_cell/std",
+    "serde_json/std",
+]

@@ -170,7 +170,23 @@ where
                     .unwrap_or_default()
                     .into()
             } else {
-                None
+                // For blocks where chain spec says Shanghai isn't active, still check
+                // if withdrawals were stored. This handles chains like PulseChain where
+                // pre-fork blocks are Ethereum mainnet blocks with a different Shanghai
+                // activation timestamp than the chain spec's.
+                match withdrawals_cursor.seek_exact(header.number())? {
+                    Some((_, w)) => Some(w.withdrawals),
+                    None => {
+                        // If the header has a withdrawals_root, this is a Shanghai block
+                        // whose empty withdrawals weren't stored (write skips empty lists).
+                        // Return an empty list to match the original block body format.
+                        if header.withdrawals_root().is_some() {
+                            Some(Default::default())
+                        } else {
+                            None
+                        }
+                    }
+                }
             };
             let ommers = if chain_spec.is_paris_active_at_block(header.number()) {
                 Vec::new()

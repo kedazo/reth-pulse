@@ -9,6 +9,7 @@ exclude = [".github/"]
 
 [workspace]
 members = [
+    "bin/pulse-reth/",
     "bin/reth-bb/",
     "bin/reth/",
     "crates/storage/rpc-provider/",
@@ -71,6 +72,12 @@ members = [
     "crates/node/events/",
     "crates/node/metrics",
     "crates/node/types",
+    "crates/pulsechain/hardforks/",
+    "crates/pulsechain/chainspec/",
+    "crates/pulsechain/consensus/",
+    "crates/pulsechain/pulse/",
+    "crates/pulsechain/evm/",
+    "crates/pulsechain/node/",
     "crates/payload/basic/",
     "crates/payload/builder/",
     "crates/payload/builder-primitives/",
@@ -315,6 +322,7 @@ incremental = false
 
 [workspace.dependencies]
 # reth
+pulse-reth = { path = "bin/pulse-reth" }
 reth = { path = "bin/reth" }
 reth-storage-rpc-provider = { path = "crates/storage/rpc-provider" }
 reth-basic-payload-builder = { path = "crates/payload/basic" }
@@ -388,6 +396,12 @@ reth-node-ethstats = { path = "crates/node/ethstats" }
 reth-node-events = { path = "crates/node/events" }
 reth-node-metrics = { path = "crates/node/metrics" }
 reth-node-types = { path = "crates/node/types" }
+reth-pulsechain-forks = { path = "crates/pulsechain/hardforks", default-features = false }
+reth-pulsechain-chainspec = { path = "crates/pulsechain/chainspec", default-features = false }
+reth-pulsechain-consensus = { path = "crates/pulsechain/consensus", default-features = false }
+reth-pulsechain = { path = "crates/pulsechain/pulse", default-features = false }
+reth-pulsechain-evm = { path = "crates/pulsechain/evm", default-features = false }
+reth-pulsechain-node = { path = "crates/pulsechain/node", default-features = false }
 reth-payload-builder = { path = "crates/payload/builder" }
 reth-payload-builder-primitives = { path = "crates/payload/builder-primitives" }
 reth-payload-primitives = { path = "crates/payload/primitives" }
