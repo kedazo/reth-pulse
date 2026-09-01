@@ -39,7 +39,7 @@ use reth_ethereum_forks::{
     ChainHardforks, DisplayHardforks, EthereumHardfork, EthereumHardforks, ForkCondition,
     ForkFilter, ForkFilterKey, ForkHash, ForkId, Hardfork, Hardforks, Head, DEV_HARDFORKS,
 };
-use reth_network_peers::{holesky_nodes, hoodi_nodes, mainnet_nodes, sepolia_nodes, pulsechain_nodes, NodeRecord};
+use reth_network_peers::{holesky_nodes, hoodi_nodes, mainnet_nodes, sepolia_nodes, NodeRecord};
 use reth_primitives_traits::{sync::LazyLock, BlockHeader, SealedHeader};
 
 /// Helper method building a [`Header`] given [`Genesis`] and [`ChainHardforks`].
@@ -772,7 +772,6 @@ impl<H: BlockHeader> ChainSpec<H> {
     pub fn bootnodes(&self) -> Option<Vec<NodeRecord>> {
         use NamedChain as C;
 
-        // Try NamedChain first, then fall back to chain ID lookup for custom chains
         match self.chain.try_into().ok()? {
             C::Mainnet => Some(mainnet_nodes()),
             C::Sepolia => Some(sepolia_nodes()),
@@ -780,13 +779,6 @@ impl<H: BlockHeader> ChainSpec<H> {
             C::Hoodi => Some(hoodi_nodes()),
             _ => None,
         }
-        .or_else(|| {
-            // Check for custom chains by chain ID
-            match self.chain.id() {
-                369 => Some(pulsechain_nodes()), // PulseChain mainnet
-                _ => None,
-            }
-        })
     }
 
     /// Convert header to another type.

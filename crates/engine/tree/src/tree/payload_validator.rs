@@ -430,13 +430,6 @@ where
             .in_scope(|| self.evm_env_for(&input))
             .map_err(NewPayloadError::other)?;
 
-        // Snapshot the canonical head hash so we can decide whether this payload is a
-        // canonical extension (parent == head) or a side-chain / orphan. Side-chain
-        // payloads must execute against an isolated cache to avoid polluting the shared
-        // PayloadExecutionCache when their execution fails mid-flight.
-        let canonical_head_hash = ctx.canonical_in_memory_state().get_canonical_head().hash();
-        let parent_is_canonical_head = input.parent_hash() == canonical_head_hash;
-
         let env = ExecutionEnv {
             evm_env,
             hash: input.hash(),
@@ -445,7 +438,6 @@ where
             transaction_count: input.transaction_count(),
             gas_used: input.gas_used(),
             withdrawals: input.withdrawals().map(|w| w.to_vec()),
-            parent_is_canonical_head,
         };
 
         // Plan the strategy used for state root computation.

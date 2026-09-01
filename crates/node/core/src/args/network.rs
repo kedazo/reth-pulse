@@ -592,16 +592,8 @@ impl DiscoveryArgs {
             network_config_builder = network_config_builder.disable_dns_discovery();
         }
 
-        // Collect bootnodes into a Vec to avoid consuming the iterator
-        let boot_nodes_vec: Vec<_> = boot_nodes.into_iter().collect();
-
         if self.disable_discovery || self.disable_discv4_discovery {
             network_config_builder = network_config_builder.disable_discv4_discovery();
-        } else {
-            // Configure discv4 with bootnodes when discovery is enabled
-            let mut discv4_builder = reth_discv4::Discv4Config::builder();
-            discv4_builder.add_boot_nodes(boot_nodes_vec.clone());
-            network_config_builder = network_config_builder.discovery(discv4_builder);
         }
 
         if self.disable_nat {
@@ -611,7 +603,7 @@ impl DiscoveryArgs {
 
         if self.should_enable_discv5() {
             network_config_builder = network_config_builder
-                .discovery_v5(self.discovery_v5_builder(rlpx_tcp_socket, boot_nodes_vec));
+                .discovery_v5(self.discovery_v5_builder(rlpx_tcp_socket, boot_nodes));
         }
 
         network_config_builder

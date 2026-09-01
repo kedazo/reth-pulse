@@ -172,12 +172,6 @@ impl RethRpcServerConfig for RpcServerArgs {
             .max_request_body_size(self.rpc_max_request_size_bytes())
             .max_response_body_size(self.rpc_max_response_size_bytes())
             .max_subscriptions_per_connection(self.rpc_max_subscriptions_per_connection.get())
-            .enable_ws_ping(
-                jsonrpsee::server::PingConfig::new()
-                    .ping_interval(std::time::Duration::from_secs(30))
-                    .inactive_limit(std::time::Duration::from_secs(120))
-                    .max_failures(3),
-            )
     }
 
     fn ipc_server_builder(&self) -> IpcServerBuilder<Identity, Identity> {

@@ -18,10 +18,6 @@ pub mod depth_first;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock;
 
-/// Caching trie cursor implementations backed by a shared node cache.
-pub mod caching;
-pub use caching::{CachingAccountTrieCursor, CachingStorageTrieCursor, CachingTrieCursorFactory};
-
 /// Metrics tracking trie cursor implementations.
 pub mod metrics;
 #[cfg(feature = "metrics")]

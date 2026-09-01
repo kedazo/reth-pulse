@@ -7055,22 +7055,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pulse-reth"
-version = "1.11.1"
-dependencies = [
- "clap",
- "eyre",
- "reth",
- "reth-chainspec",
- "reth-cli",
- "reth-cli-util",
- "reth-node-builder",
- "reth-pulsechain-chainspec",
- "reth-pulsechain-node",
- "tracing",
-]
-
-[[package]]
 name = "quanta"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9728,96 +9712,6 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "tracing",
-]
-
-[[package]]
-name = "reth-pulsechain"
-version = "1.11.1"
-dependencies = [
- "alloy-primitives",
- "reth-execution-errors",
-]
-
-[[package]]
-name = "reth-pulsechain-chainspec"
-version = "1.11.1"
-dependencies = [
- "alloy-chains",
- "alloy-genesis",
- "alloy-primitives",
- "once_cell",
- "reth-chainspec",
- "reth-ethereum-forks",
- "reth-network-peers",
- "reth-primitives-traits",
- "reth-pulsechain-forks",
- "serde_json",
-]
-
-[[package]]
-name = "reth-pulsechain-consensus"
-version = "1.11.1"
-dependencies = [
- "alloy-consensus",
- "alloy-eips",
- "alloy-primitives",
- "eyre",
- "reth-chainspec",
- "reth-consensus",
- "reth-consensus-common",
- "reth-ethereum-consensus",
- "reth-ethereum-primitives",
- "reth-execution-types",
- "reth-node-api",
- "reth-node-builder",
- "reth-primitives",
- "reth-primitives-traits",
- "reth-pulsechain-chainspec",
- "reth-pulsechain-forks",
- "tracing",
-]
-
-[[package]]
-name = "reth-pulsechain-evm"
-version = "1.11.1"
-dependencies = [
- "alloy-consensus",
- "alloy-evm",
- "alloy-primitives",
- "eyre",
- "reth-ethereum",
- "reth-pulsechain",
- "reth-pulsechain-chainspec",
- "reth-pulsechain-forks",
- "revm",
- "tracing",
-]
-
-[[package]]
-name = "reth-pulsechain-forks"
-version = "1.11.1"
-dependencies = [
- "alloy-primitives",
- "once_cell",
- "reth-ethereum-forks",
-]
-
-[[package]]
-name = "reth-pulsechain-node"
-version = "1.11.1"
-dependencies = [
- "alloy-rpc-types-eth",
- "reth-chainspec",
- "reth-engine-local",
- "reth-ethereum",
- "reth-ethereum-engine-primitives",
- "reth-ethereum-primitives",
- "reth-node-api",
- "reth-node-builder",
- "reth-payload-primitives",
- "reth-provider",
- "reth-pulsechain-consensus",
- "reth-pulsechain-evm",
 ]
 
 [[package]]
